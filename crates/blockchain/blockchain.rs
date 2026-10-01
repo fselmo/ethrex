@@ -1201,7 +1201,13 @@ impl Blockchain {
                         // compare on a BAL already in memory; the parallel exec optimization
                         // (no BAL rebuild) is preserved.
                         //
-                        // Pre-Amsterdam blocks never record a BAL, so both arms are skipped.
+                        // A supplied BAL is held to the commitment on the sequential path
+                        // too, so `--no-bal-parallel-exec` changes which executor runs, never
+                        // whether the delivered list is checked. Over engine_newPayload the
+                        // header is derived from the payload's list, so this only fires for
+                        // callers that pass the header and the list separately.
+                        //
+                        // Pre-Amsterdam blocks never record a BAL, so both checks are skipped.
                         if let Some(bal) = &produced_bal {
                             validate_block_access_list_hash(
                                 &block.header,
@@ -1210,7 +1216,8 @@ impl Blockchain {
                                 block.body.transactions.len(),
                                 &NativeCrypto,
                             )?;
-                        } else if let Some(header_bal) = header_bal.as_deref()
+                        }
+                        if let Some(header_bal) = header_bal.as_deref()
                             && chain_config.is_amsterdam_activated(block.header.timestamp)
                             && !header_bal.matches_commitment(
                                 block.header.block_access_list_hash,
