@@ -5570,3 +5570,30 @@ mod simulated_tx_encoding_tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "rayon"))]
+mod sequential_execution_reason_tests {
+    use super::{BalParallelExec, sequential_execution_reason};
+
+    #[test]
+    fn names_the_first_gate_that_rules_out_parallel() {
+        use BalParallelExec::*;
+        assert_eq!(sequential_execution_reason(true, true, Enabled), None);
+        assert_eq!(
+            sequential_execution_reason(false, false, Disabled),
+            Some("no-access-list")
+        );
+        assert_eq!(
+            sequential_execution_reason(true, false, Witness),
+            Some("pre-amsterdam")
+        );
+        assert_eq!(
+            sequential_execution_reason(true, true, Disabled),
+            Some("disabled")
+        );
+        assert_eq!(
+            sequential_execution_reason(true, true, Witness),
+            Some("witness")
+        );
+    }
+}
