@@ -1,5 +1,5 @@
 //! Shared plumbing for the standalone `blocktest` and `enginetest` runners: fixture
-//! discovery, the worker pool and the result output.
+//! discovery, the worker pool, the result output and the per-block executor report.
 
 use std::any::Any;
 use std::path::{Path, PathBuf};
@@ -8,8 +8,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use ethrex_vm::BAL_EXECUTION_TARGET;
 use regex::Regex;
 use serde::Serialize;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::filter::Targets;
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// Options every runner takes.
 #[derive(clap::Args, Debug)]
@@ -169,5 +175,62 @@ pub fn report(results: &[FixtureResult], json: bool, started: Instant) -> ExitCo
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Print the executor ethrex picks for each block as one JSON line on stderr:
+/// `{"event":"balExecution","block":N,"hash":"0x…","path":"parallel|sequential","reason":"…"}`.
+/// `reason` is empty for `parallel`; for `sequential` it is the first gate that
+/// ruled parallel out.
+pub fn report_bal_execution() {
+    let filter = Targets::new().with_target(BAL_EXECUTION_TARGET, Level::DEBUG);
+    tracing_subscriber::registry()
+        .with(BalExecutionReport.with_filter(filter))
+        .init();
+}
+
+struct BalExecutionReport;
+
+impl<S: Subscriber> Layer<S> for BalExecutionReport {
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut line = BalExecution {
+            event: "balExecution",
+            ..Default::default()
+        };
+        event.record(&mut line);
+        if let Ok(line) = serde_json::to_string(&line) {
+            eprintln!("{line}");
+        }
+    }
+}
+
+#[derive(Default, Serialize)]
+struct BalExecution {
+    event: &'static str,
+    block: u64,
+    hash: String,
+    path: String,
+    reason: String,
+}
+
+impl Visit for BalExecution {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "block" {
+            self.block = value;
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            "path" => self.path = value.to_string(),
+            "reason" => self.reason = value.to_string(),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "hash" {
+            self.hash = format!("{value:?}");
+        }
     }
 }

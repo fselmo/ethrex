@@ -9,7 +9,9 @@ use std::time::Instant;
 
 use clap::Parser;
 use ef_tests_engine::{EngineFixtureFile, RunOptions, run_fixture};
-use ef_tests_runners::{FixtureResult, RunnerArgs, collect_json_files, report, run_files};
+use ef_tests_runners::{
+    FixtureResult, RunnerArgs, collect_json_files, report, report_bal_execution, run_files,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -23,6 +25,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    report_bal_execution();
     let started = Instant::now();
     let rt = tokio::runtime::Runtime::new().expect("failed to build the tokio runtime");
     let files = collect_json_files(&cli.runner.path);
