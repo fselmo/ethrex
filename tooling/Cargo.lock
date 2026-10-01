@@ -2948,10 +2948,13 @@ dependencies = [
  "clap 4.6.0",
  "ef_tests-blockchain",
  "ef_tests-engine",
+ "ethrex-vm",
  "regex",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]

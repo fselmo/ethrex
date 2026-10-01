@@ -1,15 +1,26 @@
 //! Shared plumbing for the standalone `blocktest` and `enginetest` runners: fixture
-//! discovery, the worker pool and the result output.
+//! discovery, the worker pool, the result output and the per-block executor report.
 
 use std::any::Any;
+use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use ef_tests_blockchain::test_runner::DROPPED_ACCESS_LIST_TARGET;
+use ethrex_vm::BAL_EXECUTION_TARGET;
 use regex::Regex;
 use serde::Serialize;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::filter::Targets;
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// Options every runner takes.
 #[derive(clap::Args, Debug)]
@@ -33,6 +44,10 @@ pub struct RunnerArgs {
     /// Run every block on the sequential executor, as the node flag of the same name does.
     #[arg(long, env = "ETHREX_NO_BAL_PARALLEL_EXEC")]
     pub no_bal_parallel_exec: bool,
+
+    /// Print the executor chosen for each block as one JSON line on stderr.
+    #[arg(long)]
+    pub bal_report: bool,
 }
 
 impl RunnerArgs {
@@ -169,5 +184,258 @@ pub fn report(results: &[FixtureResult], json: bool, started: Instant) -> ExitCo
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// With `--bal-report`, print the executor ethrex picks for each block as one
+/// JSON line on stderr:
+/// `{"event":"balExecution","block":N,"hash":"0x…","path":"parallel|sequential","reason":"…"}`.
+/// `reason` is `bad-access-list` for a block whose delivered list the runner dropped
+/// (the client then sees no list, so it would say `no-access-list`). Otherwise it is
+/// empty for `parallel`, and for `sequential` the first gate that ruled parallel out.
+/// Without the flag no subscriber is installed.
+pub fn install_bal_report(args: &RunnerArgs) {
+    if let Some(layer) = bal_report_layer(args, std::io::stderr) {
+        tracing_subscriber::registry().with(layer).init();
+    }
+}
+
+fn bal_report_layer<S, W>(args: &RunnerArgs, writer: W) -> Option<impl Layer<S>>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
+    let filter = Targets::new()
+        .with_target(BAL_EXECUTION_TARGET, Level::DEBUG)
+        .with_target(DROPPED_ACCESS_LIST_TARGET, Level::DEBUG);
+    args.bal_report.then(|| {
+        BalExecutionReport {
+            writer,
+            dropped: Mutex::default(),
+        }
+        .with_filter(filter)
+    })
+}
+
+struct BalExecutionReport<W> {
+    writer: W,
+    /// Delivered lists the runner dropped whose blocks have not run yet, by block hash.
+    dropped: Mutex<HashMap<String, usize>>,
+}
+
+impl<S, W> Layer<S> for BalExecutionReport<W>
+where
+    S: Subscriber,
+    W: for<'a> MakeWriter<'a> + 'static,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut line = BalExecution {
+            event: "balExecution",
+            ..Default::default()
+        };
+        event.record(&mut line);
+        let mut dropped = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
+        if event.metadata().target() == DROPPED_ACCESS_LIST_TARGET {
+            *dropped.entry(line.hash).or_default() += 1;
+            return;
+        }
+        // Execution runs on a thread of its own, so the event can't be tied to the
+        // import that dropped the list; the hash and the client's reason can. A block
+        // whose list was dropped reaches the client with none, and ethrex's first gate
+        // (with rayon) is the access list, so it always says `no-access-list`. Another
+        // worker may run the same block with its list at the same time (a fixture and
+        // its clean twin), and its event, which names any other reason, is left alone.
+        if line.reason == "no-access-list"
+            && let Some(pending) = dropped.get_mut(&line.hash)
+        {
+            *pending -= 1;
+            if *pending == 0 {
+                dropped.remove(&line.hash);
+            }
+            line.reason = "bad-access-list".to_string();
+        }
+        drop(dropped);
+        if let Ok(mut line) = serde_json::to_string(&line) {
+            line.push('\n');
+            // One write per line, so lines from different workers don't interleave.
+            let _ = self.writer.make_writer().write_all(line.as_bytes());
+        }
+    }
+}
+
+#[derive(Default, Serialize)]
+struct BalExecution {
+    event: &'static str,
+    block: u64,
+    hash: String,
+    path: String,
+    reason: String,
+}
+
+impl Visit for BalExecution {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "block" {
+            self.block = value;
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        match field.name() {
+            "path" => self.path = value.to_string(),
+            "reason" => self.reason = value.to_string(),
+            _ => {}
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "hash" {
+            self.hash = format!("{value:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use clap::Parser;
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        runner: RunnerArgs,
+    }
+
+    #[derive(Clone, Default)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Buffer {
+        type Writer = Buffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    enum Event {
+        /// The runner dropped the block's delivered list.
+        Dropped,
+        /// The client ran the block on `path` for `reason`.
+        Executed(&'static str, &'static str),
+    }
+
+    /// The report the runner prints, given its arguments, for these events of one
+    /// block.
+    fn report_for(args: &[&str], events: &[Event]) -> String {
+        let cli = Cli::try_parse_from([&["runner", "--path", "fixtures"], args].concat())
+            .expect("valid arguments");
+        let buffer = Buffer::default();
+        let subscriber =
+            tracing_subscriber::registry().with(bal_report_layer(&cli.runner, buffer.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            for event in events {
+                match *event {
+                    Event::Dropped => tracing::debug!(
+                        target: DROPPED_ACCESS_LIST_TARGET,
+                        hash = %"0x01",
+                        "Dropping the delivered access list"
+                    ),
+                    Event::Executed(path, reason) => tracing::debug!(
+                        target: BAL_EXECUTION_TARGET,
+                        block = 1u64,
+                        hash = %"0x01",
+                        path,
+                        reason,
+                        "Executing block"
+                    ),
+                }
+            }
+        });
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes).expect("utf-8 output")
+    }
+
+    fn line(path: &str, reason: &str) -> String {
+        format!(
+            "{{\"event\":\"balExecution\",\"block\":1,\"hash\":\"0x01\",\"path\":\"{path}\",\"reason\":\"{reason}\"}}\n"
+        )
+    }
+
+    #[test]
+    fn bal_report_prints_one_line_per_block() {
+        assert_eq!(
+            report_for(
+                &["--bal-report"],
+                &[Event::Executed("sequential", "disabled")]
+            ),
+            line("sequential", "disabled")
+        );
+    }
+
+    #[test]
+    fn bal_report_names_a_dropped_list() {
+        assert_eq!(
+            report_for(
+                &["--bal-report"],
+                &[
+                    Event::Dropped,
+                    Event::Executed("sequential", "no-access-list")
+                ]
+            ),
+            line("sequential", "bad-access-list")
+        );
+        assert_eq!(
+            report_for(
+                &["--bal-report"],
+                &[Event::Executed("sequential", "no-access-list")]
+            ),
+            line("sequential", "no-access-list")
+        );
+    }
+
+    /// A fixture and its clean twin share the block hash and may run at once: the
+    /// twin, which kept its list, keeps its own line.
+    #[test]
+    fn bal_report_leaves_the_same_block_with_its_list_alone() {
+        for (path, reason) in [("parallel", ""), ("sequential", "disabled")] {
+            assert_eq!(
+                report_for(
+                    &["--bal-report"],
+                    &[
+                        Event::Dropped,
+                        Event::Executed(path, reason),
+                        Event::Executed("sequential", "no-access-list"),
+                    ]
+                ),
+                line(path, reason) + &line("sequential", "bad-access-list")
+            );
+        }
+    }
+
+    #[test]
+    fn no_bal_report_without_the_flag() {
+        assert_eq!(
+            report_for(
+                &[],
+                &[
+                    Event::Dropped,
+                    Event::Executed("sequential", "no-access-list")
+                ]
+            ),
+            ""
+        );
     }
 }
