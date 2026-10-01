@@ -33,8 +33,12 @@ pub struct RunnerArgs {
     pub run: Option<Regex>,
 
     /// Print the results to stdout as a JSON array.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "jsonl")]
     pub json: bool,
+
+    /// Print the results to stdout as JSON lines, one fixture per line.
+    #[arg(long)]
+    pub jsonl: bool,
 
     /// Run every block on the sequential executor, as the node flag of the same name does.
     #[arg(long, env = "ETHREX_NO_BAL_PARALLEL_EXEC")]
@@ -147,10 +151,20 @@ where
     results
 }
 
-/// Print the results (a JSON array on stdout with `json`, failures on stderr
-/// otherwise) and a summary on stderr, and return the exit code.
-pub fn report(results: &[FixtureResult], json: bool, started: Instant) -> ExitCode {
-    if json {
+/// Print the results (on stdout as a JSON array or JSON lines when asked, as
+/// failures on stderr otherwise) and a summary on stderr, and return the exit code.
+pub fn report(results: &[FixtureResult], args: &RunnerArgs, started: Instant) -> ExitCode {
+    if args.jsonl {
+        for result in results {
+            match serde_json::to_string(result) {
+                Ok(line) => println!("{line}"),
+                Err(e) => {
+                    eprintln!("failed to serialize a result: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    } else if args.json {
         match serde_json::to_string_pretty(results) {
             Ok(out) => println!("{out}"),
             Err(e) => {

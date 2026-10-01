@@ -32,7 +32,7 @@ fn main() -> ExitCode {
     let results = run_files(&files, cli.runner.workers, |file| {
         run_file(file, &cli.runner, &rt)
     });
-    report(&results, cli.runner.json, started)
+    report(&results, &cli.runner, started)
 }
 
 fn run_file(file: &Path, args: &RunnerArgs, rt: &tokio::runtime::Runtime) -> Vec<FixtureResult> {
