@@ -54,6 +54,22 @@ pub const SKIPPED_TESTS: &[&str] = &[
     "createBlobhashTx",
 ];
 
+/// How a fixture's blocks are executed.
+#[derive(Debug, Clone, Copy)]
+pub struct RunOptions {
+    /// Run blocks that carry an access list on the BAL-driven parallel executor,
+    /// as a node does unless started with `--no-bal-parallel-exec`.
+    pub bal_parallel_exec: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            bal_parallel_exec: true,
+        }
+    }
+}
+
 /// Why a fixture is not run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
@@ -101,7 +117,12 @@ pub fn parse_and_execute(
         }
         executed += 1;
 
-        let result = rt.block_on(run_ef_test(&test_key, &test, run_stateless));
+        let result = rt.block_on(run_ef_test(
+            &test_key,
+            &test,
+            run_stateless,
+            &RunOptions::default(),
+        ));
 
         if let Err(e) = result {
             eprintln!("Test {test_key} failed: {e:?}");
@@ -136,6 +157,7 @@ pub async fn run_ef_test(
     test_key: &str,
     test: &TestUnit,
     run_stateless: bool,
+    options: &RunOptions,
 ) -> Result<(), String> {
     // check that the decoded genesis block header matches the deserialized one
     let genesis_rlp = test.genesis_rlp.clone();
@@ -154,7 +176,8 @@ pub async fn run_ef_test(
     check_prestate_against_db(test_key, test, &store);
 
     // Blockchain EF tests are meant for L1.
-    let blockchain = Blockchain::for_test_harness_with_pool(store.clone(), merkle_pool());
+    let mut blockchain = Blockchain::for_test_harness_with_pool(store.clone(), merkle_pool());
+    blockchain.options.bal_parallel_exec_enabled = options.bal_parallel_exec;
 
     // Early return if the exception is in the rlp decoding of the block
     for bf in &test.blocks {
@@ -173,8 +196,12 @@ pub async fn run_ef_test(
     // and doesn't drive `add_block_pipeline`, and BAL-warmed parallel execution gives no
     // benefit in single-threaded zkVM guest builds. The non-stateless runs are the right
     // home for this check.
+    // Only needed when the fixture delivers no access lists: otherwise `run` has
+    // already executed every block in parallel on the fixture's own lists. Skipped
+    // when parallel execution is off, since pass 2 would run it anyway.
     #[cfg(not(feature = "stateless"))]
-    if test.network == Fork::Amsterdam {
+    if test.network == Fork::Amsterdam && options.bal_parallel_exec && !delivers_access_lists(test)
+    {
         run_two_pass_parallel(test_key, test).await?;
     }
 
@@ -265,6 +292,15 @@ async fn run(
     // Final post-state verification
     check_poststate_against_db(test_key, test, store).await;
     Ok(())
+}
+
+/// Whether any block of the fixture carries its access list.
+#[cfg(not(feature = "stateless"))]
+fn delivers_access_lists(test: &TestUnit) -> bool {
+    test.blocks.iter().any(|b| {
+        b.block()
+            .is_some_and(|block| block.block_access_list_data.is_some())
+    })
 }
 
 /// Two-pass parallel execution check for Amsterdam tests.
