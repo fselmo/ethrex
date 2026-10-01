@@ -9,6 +9,8 @@ pub mod backends;
 /// EIP-8037 (Amsterdam+, PR #2703) per-tx 2D inclusion check. Re-exported so the
 /// payload builder can enforce it with identical semantics to the validator.
 pub use backends::levm::check_2d_gas_allowance;
+/// The parallel-executor switch and the tracing target that reports each block's executor.
+pub use backends::levm::{BAL_EXECUTION_TARGET, BalParallelExec};
 /// Bounds the parallel Amsterdam path uses to reject an over-limit block early.
 pub use backends::levm::{CompletedGas, block_work_budget, check_minimum_block_work};
 pub use backends::{

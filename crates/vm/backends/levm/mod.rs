@@ -1,6 +1,52 @@
 pub mod db;
 mod tracing;
 
+/// Tracing target of the per-block event that names the executor chosen for a block
+/// (`path`: `parallel` or `sequential`) and, for the sequential one, the first
+/// condition that ruled parallel out (`reason`). Test runners turn it on to report
+/// the choice; a node logs it only when that target is enabled at debug level.
+pub const BAL_EXECUTION_TARGET: &str = "ethrex_vm::bal_execution";
+
+/// Whether a block that carries an access list may run on the BAL-driven parallel
+/// executor, and if not, why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BalParallelExec {
+    Enabled,
+    /// Turned off by `--no-bal-parallel-exec`.
+    Disabled,
+    /// Turned off because the caller collects an execution witness.
+    Witness,
+}
+
+impl BalParallelExec {
+    pub fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
+/// The first condition, in gate order, that keeps a block off the parallel executor,
+/// or `None` when it runs there.
+fn sequential_execution_reason(
+    has_access_list: bool,
+    is_amsterdam: bool,
+    parallel: BalParallelExec,
+) -> Option<&'static str> {
+    if !cfg!(feature = "rayon") {
+        return Some("no-rayon");
+    }
+    if !has_access_list {
+        return Some("no-access-list");
+    }
+    if !is_amsterdam {
+        return Some("pre-amsterdam");
+    }
+    match parallel {
+        BalParallelExec::Enabled => None,
+        BalParallelExec::Disabled => Some("disabled"),
+        BalParallelExec::Witness => Some("witness"),
+    }
+}
+
 use super::{BlockExecutionResult, FrameValidationOutcome, TxGasBreakdown, compute_burned_fees};
 use crate::system_contracts::{
     AMSTERDAM_REQUEST_PREDEPLOYS, BEACON_ROOTS_ADDRESS, BUILDER_DEPOSIT_CONTRACT_ADDRESS,
@@ -561,6 +607,9 @@ impl LEVM {
     /// `merkleizer` is `Some` on the streaming (non-BAL) path; the BAL validation path
     /// passes `None` because the caller merkleizes optimistically from the input BAL and
     /// the EVM-side `bal_to_account_updates` send is then redundant work.
+    ///
+    /// Emits one debug event per block on [`BAL_EXECUTION_TARGET`] naming the executor
+    /// chosen and, for the sequential one, why.
     #[allow(clippy::too_many_arguments)]
     pub fn execute_block_pipeline(
         block: &Block,
@@ -570,7 +619,7 @@ impl LEVM {
         queue_length: &AtomicUsize,
         crypto: &dyn Crypto,
         header_bal: Option<Arc<BlockAccessList>>,
-        bal_parallel_exec_enabled: bool,
+        bal_parallel_exec: BalParallelExec,
         stateless_validator: Option<&dyn StatelessValidator>,
     ) -> Result<(BlockExecutionResult, Option<BlockAccessList>), EvmError> {
         let chain_config = db.store.get_chain_config()?;
@@ -595,19 +644,29 @@ impl LEVM {
                     EvmError::Transaction(format!("Couldn't recover addresses with error: {error}"))
                 })?;
 
+        let sequential_reason =
+            sequential_execution_reason(header_bal.is_some(), is_amsterdam, bal_parallel_exec);
+        ::tracing::debug!(
+            target: BAL_EXECUTION_TARGET,
+            block = block.header.number,
+            hash = %format_args!("{:#x}", block.hash()),
+            path = if sequential_reason.is_some() { "sequential" } else { "parallel" },
+            reason = sequential_reason.unwrap_or_default(),
+            "Executing block"
+        );
         #[cfg(not(feature = "rayon"))]
         // Without rayon there is no parallel BAL path, so these are unused.
         // Adding dummy let to avoid unused warnings.
-        let _ = (header_bal, bal_parallel_exec_enabled);
+        let _ = header_bal;
         #[cfg(feature = "rayon")]
         // When BAL is provided (Amsterdam+ validation path): use parallel execution.
         // The `is_amsterdam` gate is required: `execute_block_parallel` (and the
         // optimistic merkleization it feeds) is only correct on Amsterdam+; a
         // pre-Amsterdam call here in release would skip the inner debug_assert.
         // `--no-bal-parallel-exec` opts out and falls through to the sequential pipeline below.
+        // See `sequential_execution_reason` for the full gate.
         if let Some(bal) = header_bal
-            && is_amsterdam
-            && bal_parallel_exec_enabled
+            && sequential_reason.is_none()
         {
             // Validate header BAL structural properties before execution.
             // This catches index-out-of-bounds early, before wasting execution time.
@@ -5278,7 +5337,7 @@ mod burned_fees_tests {
             &queue_len,
             &crypto,
             None, // no BAL → sequential path
-            false,
+            BalParallelExec::Disabled,
             None,
         )
         .expect("execute_block_pipeline succeeded");
@@ -5366,7 +5425,7 @@ mod burned_fees_tests {
             &queue_len_b,
             &crypto,
             None, // no BAL → sequential path (site 3)
-            false,
+            BalParallelExec::Disabled,
             None,
         )
         .expect("execute_block_pipeline sequential with SSTORE clear succeeded");
@@ -5402,7 +5461,7 @@ mod burned_fees_tests {
             &queue_len_c,
             &crypto,
             Some(std::sync::Arc::new(bal_c)), // ← parallel path (site 2)
-            true,
+            BalParallelExec::Enabled,
             None,
         )
         .expect("execute_block_pipeline parallel with SSTORE clear succeeded");

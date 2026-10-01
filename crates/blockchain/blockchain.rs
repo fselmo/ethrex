@@ -108,7 +108,7 @@ use ethrex_vm::backends::VMType;
 #[cfg(feature = "rayon")]
 use ethrex_vm::backends::levm::LEVM;
 use ethrex_vm::backends::levm::db::DatabaseLogger;
-use ethrex_vm::{BlockExecutionResult, DynVmDatabase, Evm, EvmError, VmDatabase};
+use ethrex_vm::{BalParallelExec, BlockExecutionResult, DynVmDatabase, Evm, EvmError, VmDatabase};
 use mempool::{
     BalanceCheck, FRAME_CANONICAL_PAYMASTER_CODE_HASH, FramePaymasterReservation, Mempool,
     SenderAdmission, is_canonical_paymaster,
@@ -915,7 +915,14 @@ impl Blockchain {
         // re-read in-block-created state (e.g. a code deployed by an earlier
         // tx) from the logged store, while sequential execution serves it from
         // VM caches — recording accesses the canonical execution never makes.
-        let bal_parallel_exec_enabled = self.options.bal_parallel_exec_enabled && !collect_witness;
+        let bal_parallel_exec = if !self.options.bal_parallel_exec_enabled {
+            BalParallelExec::Disabled
+        } else if collect_witness {
+            BalParallelExec::Witness
+        } else {
+            BalParallelExec::Enabled
+        };
+        let bal_parallel_exec_enabled = bal_parallel_exec.is_enabled();
 
         // Synthesize BAL updates pre-scope so the merkleizer thread can start
         // trie work immediately, in parallel with execution.
@@ -1148,7 +1155,7 @@ impl Blockchain {
                             tx,
                             queue_length_ref,
                             bal,
-                            bal_parallel_exec_enabled,
+                            bal_parallel_exec,
                         );
                         cancelled_ref.store(true, Ordering::Relaxed);
                         let (execution_result, produced_bal) = result?;
