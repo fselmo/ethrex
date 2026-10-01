@@ -2969,6 +2969,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ef_tests-statetest"
+version = "4.0.0"
+dependencies = [
+ "clap 4.6.0",
+ "ethrex-common 28.0.0",
+ "ethrex-crypto",
+ "ethrex-levm",
+ "ethrex-rlp 28.0.0",
+ "rayon",
+ "regex",
+ "rustc-hash 2.1.2",
+ "secp256k1 0.30.0",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ef_tests-statev2"
 version = "4.0.0"
 dependencies = [
