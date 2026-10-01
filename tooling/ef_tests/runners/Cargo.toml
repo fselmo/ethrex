@@ -1,0 +1,24 @@
+[package]
+name = "ef_tests-runners"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+documentation.workspace = true
+license.workspace = true
+
+[dependencies]
+ef_tests-blockchain = { path = "../blockchain" }
+
+clap.workspace = true
+regex = "1.11.1"
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["full"] }
+
+[features]
+default = ["c-kzg"]
+c-kzg = ["ef_tests-blockchain/c-kzg"]
+
+[[bin]]
+name = "blocktest"
+path = "src/bin/blocktest.rs"
