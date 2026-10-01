@@ -43,7 +43,10 @@ fn run_file(file: &Path, args: &RunnerArgs, rt: &tokio::runtime::Runtime) -> Vec
             return vec![FixtureResult::new(name, String::new(), Some(e))];
         }
     };
-    let opts = RunOptions::from_env();
+    let opts = RunOptions {
+        bal_parallel_exec: !args.no_bal_parallel_exec,
+        ..RunOptions::from_env()
+    };
     let mut results = Vec::new();
     for (name, fixture) in fixtures.iter().filter(|(name, _)| args.selects(name)) {
         let outcome = catch_unwind(AssertUnwindSafe(|| {

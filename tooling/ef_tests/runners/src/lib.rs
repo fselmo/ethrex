@@ -29,6 +29,10 @@ pub struct RunnerArgs {
     /// Print the results to stdout as a JSON array.
     #[arg(long)]
     pub json: bool,
+
+    /// Run every block on the sequential executor, as the node flag of the same name does.
+    #[arg(long, env = "ETHREX_NO_BAL_PARALLEL_EXEC")]
+    pub no_bal_parallel_exec: bool,
 }
 
 impl RunnerArgs {
