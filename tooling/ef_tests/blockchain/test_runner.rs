@@ -187,9 +187,12 @@ async fn run(
         // Won't panic because test has been validated
         let block: CoreBlock = block_fixture.block().unwrap().clone().into();
         let hash = block.hash();
+        // Hand the block the access list the fixture delivers, as engine_newPayload
+        // would, so it is validated and drives the parallel executor.
+        let bal = block_fixture.block_access_list()?.map(Arc::new);
 
         // Attempt to add the block as the head of the chain
-        let chain_result = blockchain.add_block_pipeline(block.clone(), None);
+        let chain_result = blockchain.add_block_pipeline(block.clone(), bal);
 
         match chain_result {
             Err(error) => {
