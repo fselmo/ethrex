@@ -12,6 +12,9 @@ use crate::harness::{Backend, EngineApiHarness};
 pub struct RunOptions {
     pub backend: Backend,
     pub strict_exceptions: bool,
+    /// Run blocks that carry an access list on the BAL-driven parallel executor,
+    /// as a node does unless started with `--no-bal-parallel-exec`.
+    pub bal_parallel_exec: bool,
 }
 
 impl RunOptions {
@@ -21,6 +24,7 @@ impl RunOptions {
             strict_exceptions: std::env::var("ETHREX_ENGINE_STRICT_EXCEPTIONS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            bal_parallel_exec: true,
         }
     }
 }
@@ -206,9 +210,13 @@ pub async fn run_fixture(
     let genesis = fix
         .build_genesis()
         .map_err(|e| FixtureFailure::FixtureParse(e.to_string()))?;
-    let harness = Box::pin(EngineApiHarness::from_genesis(genesis, opts.backend))
-        .await
-        .map_err(|e| FixtureFailure::HarnessSetup(e.to_string()))?;
+    let harness = Box::pin(EngineApiHarness::from_genesis(
+        genesis,
+        opts.backend,
+        opts.bal_parallel_exec,
+    ))
+    .await
+    .map_err(|e| FixtureFailure::HarnessSetup(e.to_string()))?;
 
     // 3. Initial FCU to genesis (mirrors test_via_engine.py:80–105)
     let first = fix
@@ -564,6 +572,7 @@ mod tests {
         RunOptions {
             backend: Backend::InMemory,
             strict_exceptions: false,
+            bal_parallel_exec: true,
         }
     }
 
