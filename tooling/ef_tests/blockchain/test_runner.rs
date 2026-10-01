@@ -42,6 +42,41 @@ fn merkle_pool() -> Arc<rayon::ThreadPool> {
     MERKLE_POOL.with(|cell| cell.get_or_init(Blockchain::build_merkle_pool).clone())
 }
 
+/// Tests skipped by every run: they take too long, or ethrex cannot represent them.
+pub const SKIPPED_TESTS: &[&str] = &[
+    // Skip because they take too long to run, but they pass
+    "static_Call50000_sha256",
+    "CALLBlake2f_MaxRounds",
+    "loopMul",
+    // Skip because it tries to deserialize number > U256::MAX
+    "ValueOverflowParis",
+    // Skip because it's a "Create" Blob Transaction, which doesn't actually exist. It never reaches the EVM because we can't even parse it as an actual Transaction.
+    "createBlobhashTx",
+];
+
+/// Why a fixture is not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Its name contains an entry of the skip list.
+    Named,
+    /// Its fork is before the Merge, which ethrex does not execute.
+    PreMerge,
+}
+
+pub fn skip_reason(
+    test_key: &str,
+    test: &TestUnit,
+    skipped_tests: Option<&[&str]>,
+) -> Option<SkipReason> {
+    if skipped_tests.is_some_and(|skipped| skipped.iter().any(|s| test_key.contains(s))) {
+        return Some(SkipReason::Named);
+    }
+    if test.network < Fork::Merge {
+        return Some(SkipReason::PreMerge);
+    }
+    None
+}
+
 pub fn parse_and_execute(
     path: &Path,
     skipped_tests: Option<&[&str]>,
@@ -56,15 +91,13 @@ pub fn parse_and_execute(
     let parsed = tests.len();
 
     for (test_key, test) in tests {
-        let named = skipped_tests
-            .map(|skipped| skipped.iter().any(|s| test_key.contains(s)))
-            .unwrap_or(false);
-        if named {
-            skipped_by_name += 1;
-            continue;
-        }
-        if test.network < Fork::Merge {
-            continue;
+        match skip_reason(&test_key, &test, skipped_tests) {
+            Some(SkipReason::Named) => {
+                skipped_by_name += 1;
+                continue;
+            }
+            Some(SkipReason::PreMerge) => continue,
+            None => {}
         }
         executed += 1;
 
