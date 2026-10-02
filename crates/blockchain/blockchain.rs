@@ -5418,6 +5418,30 @@ mod tests {
             .await
             .expect("the block must import without the peer's list");
     }
+
+    /// The parallel executor must reject a supplied list out of order for its ordering,
+    /// before execution reaches a lookup that the misordering breaks.
+    #[tokio::test]
+    async fn parallel_execution_rejects_a_list_out_of_order_for_its_order() {
+        let (blockchain, block, bal) = amsterdam_block_with_access_list().await;
+        let mut accounts = bal.accounts().to_vec();
+        // Reversing the beacon-roots writes breaks the executor's slot lookups.
+        let account = accounts
+            .iter_mut()
+            .find(|account| account.storage_changes.len() >= 2)
+            .expect("the beacon-roots call writes two slots");
+        account.storage_changes.reverse();
+        let reordered = BlockAccessList::from_accounts(accounts);
+
+        let err = blockchain
+            .add_block_pipeline(block, Some(Arc::new(reordered)))
+            .expect_err("a list out of order must be rejected");
+        assert!(
+            err.to_string()
+                .contains("storage_changes not in strictly ascending order"),
+            "rejected for another reason: {err}"
+        );
+    }
 }
 
 #[cfg(test)]
