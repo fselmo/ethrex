@@ -73,6 +73,17 @@ impl Default for RunOptions {
     }
 }
 
+/// A block the client rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    /// The block's position in the fixture's `blocks`, from 0.
+    pub index: usize,
+    /// The block's hash, unless the block did not decode.
+    pub hash: Option<H256>,
+    /// The client's error, as it reports it.
+    pub error: String,
+}
+
 /// Why a fixture is not run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
@@ -125,6 +136,7 @@ pub fn parse_and_execute(
             &test,
             run_stateless,
             &RunOptions::default(),
+            &mut Vec::new(),
         ));
 
         if let Err(e) = result {
@@ -156,11 +168,14 @@ pub fn parse_and_execute(
     }
 }
 
+/// Run one fixture, adding each block the client rejects to `rejections` as it
+/// happens, so they are there even when the fixture then fails or panics.
 pub async fn run_ef_test(
     test_key: &str,
     test: &TestUnit,
     run_stateless: bool,
     options: &RunOptions,
+    rejections: &mut Vec<Rejection>,
 ) -> Result<(), String> {
     // check that the decoded genesis block header matches the deserialized one
     let genesis_rlp = test.genesis_rlp.clone();
@@ -183,13 +198,23 @@ pub async fn run_ef_test(
     blockchain.options.bal_parallel_exec_enabled = options.bal_parallel_exec;
 
     // Early return if the exception is in the rlp decoding of the block
-    for bf in &test.blocks {
-        if bf.expect_exception.is_some() && exception_in_rlp_decoding(bf) {
+    for (index, bf) in test.blocks.iter().enumerate() {
+        if bf.expect_exception.is_none() {
+            continue;
+        }
+        if let Err(error) = CoreBlock::decode(bf.rlp.as_ref()) {
+            rejections.push(Rejection {
+                index,
+                hash: None,
+                error: error.to_string(),
+            });
+        }
+        if exception_in_rlp_decoding(bf) {
             return Ok(());
         }
     }
 
-    run(test_key, test, &blockchain, &store).await?;
+    run(test_key, test, &blockchain, &store, rejections).await?;
 
     // For Amsterdam tests, exercise the parallel BAL execution path as a correctness check.
     // Two-pass approach: pass 1 collects the BAL produced by sequential execution, pass 2
@@ -242,9 +267,10 @@ async fn run(
     test: &TestUnit,
     blockchain: &Blockchain,
     store: &Store,
+    rejections: &mut Vec<Rejection>,
 ) -> Result<(), String> {
     // Execute all blocks in test
-    for block_fixture in test.blocks.iter() {
+    for (index, block_fixture) in test.blocks.iter().enumerate() {
         let expects_exception = block_fixture.expect_exception.is_some();
 
         // Won't panic because test has been validated
@@ -257,6 +283,11 @@ async fn run(
 
         match chain_result {
             Err(error) => {
+                rejections.push(Rejection {
+                    index,
+                    hash: Some(hash),
+                    error: error.to_string(),
+                });
                 if !expects_exception {
                     return Err(format!(
                         "Transaction execution unexpectedly failed on test: {test_key}, with error {error:?}",

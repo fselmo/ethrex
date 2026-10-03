@@ -73,6 +73,39 @@ pub struct FixtureResult {
     pub pass: bool,
     pub fork: String,
     pub error: String,
+    /// Every block or payload the client rejected, with its error as the client
+    /// gave it. The runner does not check these against the fixture's expected
+    /// exception; whoever reads the results can.
+    pub rejections: Vec<Rejection>,
+}
+
+/// A block (in `blocks`) or payload (in `engineNewPayloads`) the client rejected.
+#[derive(Debug, Serialize)]
+pub struct Rejection {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    pub error: String,
+}
+
+impl From<ef_tests_blockchain::test_runner::Rejection> for Rejection {
+    fn from(r: ef_tests_blockchain::test_runner::Rejection) -> Self {
+        Self {
+            index: r.index,
+            hash: r.hash.map(|hash| format!("{hash:#x}")),
+            error: r.error,
+        }
+    }
+}
+
+impl From<ef_tests_engine::Rejection> for Rejection {
+    fn from(r: ef_tests_engine::Rejection) -> Self {
+        Self {
+            index: r.index,
+            hash: r.hash.map(|hash| format!("{hash:#x}")),
+            error: r.error,
+        }
+    }
 }
 
 impl FixtureResult {
@@ -82,6 +115,7 @@ impl FixtureResult {
             pass: error.is_none(),
             fork,
             error: error.unwrap_or_default(),
+            rejections: Vec::new(),
         }
     }
 
@@ -91,13 +125,17 @@ impl FixtureResult {
         name: String,
         fork: String,
         outcome: Result<Result<(), String>, Box<dyn Any + Send>>,
+        rejections: Vec<Rejection>,
     ) -> Self {
         let error = match outcome {
             Ok(Ok(())) => None,
             Ok(Err(e)) => Some(e),
             Err(panic) => Some(panic_message(panic)),
         };
-        Self::new(name, fork, error)
+        Self {
+            rejections,
+            ..Self::new(name, fork, error)
+        }
     }
 }
 
