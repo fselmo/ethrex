@@ -45,6 +45,18 @@ fn parse_backend_env() -> Backend {
     }
 }
 
+/// A payload the client rejected, with an `INVALID` status or a JSON-RPC error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    /// The payload's position in the fixture's `engineNewPayloads`, from 0.
+    pub index: usize,
+    /// The payload's `blockHash`, for an `INVALID` status.
+    pub hash: Option<H256>,
+    /// The `validationError`, or for a JSON-RPC error `<code>: <message>` and,
+    /// when the error carries data, `: <data>`.
+    pub error: String,
+}
+
 #[derive(Debug)]
 pub enum FixtureFailure {
     SkippedPreParis,
@@ -193,10 +205,13 @@ impl fmt::Display for FixtureFailure {
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
+/// Run one fixture, adding each payload the client rejects to `rejections` as it
+/// happens, so they are there even when the fixture then fails.
 pub async fn run_fixture(
     name: &str,
     fix: &EngineFixture,
     opts: &RunOptions,
+    rejections: &mut Vec<Rejection>,
 ) -> Result<(), FixtureFailure> {
     // 1. Pre-Paris skip
     let fork = fix
@@ -263,6 +278,18 @@ pub async fn run_fixture(
             index: i,
             msg: e.to_string(),
         })?;
+        if let Some(error) = rejection_error(&resp) {
+            let hash = if resp.get("error").is_some() {
+                None
+            } else {
+                payload.head_block_hash().ok()
+            };
+            rejections.push(Rejection {
+                index: i,
+                hash,
+                error,
+            });
+        }
         check_payload_response(&resp, payload, i, opts.strict_exceptions, name)?;
         if with_witness && payload.valid() {
             check_witness_response(&resp, payload, i, name)?;
@@ -416,6 +443,30 @@ fn witness_diff_detail(section: &str, got: &[Vec<u8>], exp: &[Vec<u8>]) -> Strin
             fmt_items(&extra)
         )
     }
+}
+
+/// The client's error for a `newPayload` response that rejects the payload: its
+/// `validationError` for an `INVALID` status, or the JSON-RPC error as
+/// `<code>: <message>`, plus `: <data>` when the error carries data (a string as
+/// is, anything else as compact JSON).
+fn rejection_error(resp: &Value) -> Option<String> {
+    if let Some(err) = resp.get("error") {
+        let code = err.get("code").map(Value::to_string).unwrap_or_default();
+        let message = err.get("message").and_then(Value::as_str).unwrap_or("");
+        let mut error = format!("{code}: {message}");
+        match err.get("data") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(data)) => error.push_str(&format!(": {data}")),
+            Some(data) => error.push_str(&format!(": {data}")),
+        }
+        return Some(error);
+    }
+    let result = resp.get("result")?;
+    if result.get("status").and_then(Value::as_str) != Some("INVALID") {
+        return None;
+    }
+    let validation_error = result.get("validationError").and_then(Value::as_str);
+    Some(validation_error.unwrap_or_default().to_string())
 }
 
 fn check_payload_response(
@@ -576,6 +627,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rejection_error_is_the_clients_error() {
+        let error = |resp: Value| rejection_error(&resp);
+        assert_eq!(
+            error(serde_json::json!({"result": {"status": "INVALID", "validationError": "bad"}})),
+            Some("bad".to_string())
+        );
+        assert_eq!(
+            error(serde_json::json!({"result": {"status": "VALID", "validationError": null}})),
+            None
+        );
+        assert_eq!(
+            error(serde_json::json!({"error": {"code": -38005, "message": "Unsupported fork"}})),
+            Some("-38005: Unsupported fork".to_string())
+        );
+        assert_eq!(
+            error(serde_json::json!({"error": {"code": -32602, "message": "m", "data": "d"}})),
+            Some("-32602: m: d".to_string())
+        );
+        assert_eq!(
+            error(
+                serde_json::json!({"error": {"code": -32602, "message": "m", "data": {"err": "e"}}})
+            ),
+            Some(r#"-32602: m: {"err":"e"}"#.to_string())
+        );
+    }
+
     /// Pre-Paris fixtures must return SkippedPreParis (is_skip() == true).
     #[tokio::test]
     async fn pre_paris_returns_skip() {
@@ -607,7 +685,7 @@ mod tests {
         let fixtures: EngineFixtureFile = serde_json::from_str(&raw).unwrap();
         let opts = inmem_opts();
         let (name, fixture) = fixtures.iter().next().unwrap();
-        let err = run_fixture(name, fixture, &opts)
+        let err = run_fixture(name, fixture, &opts, &mut Vec::new())
             .await
             .expect_err("London fixture must be skipped");
         assert!(err.is_skip(), "expected SkippedPreParis, got: {err}");
