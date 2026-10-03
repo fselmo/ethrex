@@ -64,10 +64,12 @@ fn run_file(file: &Path, args: &RunnerArgs, rt: &tokio::runtime::Runtime) -> Vec
             args.selects(name) && skip_reason(name, test, Some(SKIPPED_TESTS)).is_none()
         })
         .map(|(name, test)| {
+            let mut rejections = Vec::new();
             let outcome = catch_unwind(AssertUnwindSafe(|| {
-                rt.block_on(run_ef_test(&name, &test, false, &options))
+                rt.block_on(run_ef_test(&name, &test, false, &options, &mut rejections))
             }));
-            FixtureResult::from_outcome(name, format!("{:?}", test.network), outcome)
+            let rejections = rejections.into_iter().map(Into::into).collect();
+            FixtureResult::from_outcome(name, format!("{:?}", test.network), outcome, rejections)
         })
         .collect()
 }

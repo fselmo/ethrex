@@ -59,8 +59,9 @@ fn run_file(file: &Path, args: &RunnerArgs, rt: &tokio::runtime::Runtime) -> Vec
     };
     let mut results = Vec::new();
     for (name, fixture) in fixtures.iter().filter(|(name, _)| args.selects(name)) {
+        let mut rejections = Vec::new();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            rt.block_on(run_fixture(name, fixture, &opts))
+            rt.block_on(run_fixture(name, fixture, &opts, &mut rejections))
         }));
         let outcome = match outcome {
             Ok(Err(failure)) if failure.is_skip() => continue,
@@ -71,6 +72,7 @@ fn run_file(file: &Path, args: &RunnerArgs, rt: &tokio::runtime::Runtime) -> Vec
             name.clone(),
             fixture.network.clone(),
             outcome,
+            rejections.into_iter().map(Into::into).collect(),
         ));
     }
     results
