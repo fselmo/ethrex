@@ -161,7 +161,7 @@ fn engine_runner(path: &Path) -> datatest_stable::Result<()> {
             continue;
         }
         total += 1;
-        let result = runtime().block_on(run_fixture(name, fixture, &opts));
+        let result = runtime().block_on(run_fixture(name, fixture, &opts, &mut Vec::new()));
         let listed_broken = upstream_broken().contains(name.as_str());
         match result {
             Ok(()) if listed_broken => failures.push((
