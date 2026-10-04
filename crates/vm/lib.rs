@@ -6,6 +6,8 @@ mod witness_db;
 
 pub mod backends;
 
+/// The tracing target that reports each block's executor.
+pub use backends::levm::BAL_EXECUTION_TARGET;
 /// EIP-8037 (Amsterdam+, PR #2703) per-tx 2D inclusion check. Re-exported so the
 /// payload builder can enforce it with identical semantics to the validator.
 pub use backends::levm::check_2d_gas_allowance;
