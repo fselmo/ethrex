@@ -15,7 +15,8 @@ use ef_tests_runners::{
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "enginetest",
+    name = "ethrex-enginetest",
+    version,
     about = "Run blockchain_test_engine fixtures through ethrex's Engine API"
 )]
 struct Cli {
