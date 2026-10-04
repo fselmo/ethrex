@@ -799,8 +799,19 @@ async fn run_blocks_pipeline(
         let mut last_valid_hash = H256::default();
         for (block, bal) in blocks.into_iter().zip(bals.into_iter()) {
             let block_hash = block.hash();
+            // A peer's list is used only if it matches the header commitment and is in
+            // order, as in `Blockchain::add_blocks_in_batch`: the parallel executor runs from a
+            // supplied list with no fallback, so a bad one would fail a valid block here.
+            let bal = bal
+                .filter(|bal| {
+                    bal.matches_commitment(
+                        block.header.block_access_list_hash,
+                        &ethrex_crypto::NativeCrypto,
+                    ) && bal.validate_ordering().is_ok()
+                })
+                .map(Arc::new);
             blockchain
-                .add_block_pipeline_bounded(block, bal.map(Arc::new), DB_COMMIT_THRESHOLD)
+                .add_block_pipeline_bounded(block, bal, DB_COMMIT_THRESHOLD)
                 .map(|_| ())
                 .map_err(|e| {
                     (
