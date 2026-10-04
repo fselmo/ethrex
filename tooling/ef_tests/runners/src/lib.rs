@@ -2,7 +2,7 @@
 //! discovery, the worker pool, the result output and the per-block executor report.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use clap::ArgAction;
 use ef_tests_blockchain::test_runner::DROPPED_ACCESS_LIST_TARGET;
 use ethrex_vm::BAL_EXECUTION_TARGET;
 use regex::Regex;
@@ -25,9 +26,13 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// Options every runner takes.
 #[derive(clap::Args, Debug)]
 pub struct RunnerArgs {
-    /// Fixture directory (searched recursively) or a single .json file.
-    #[arg(short, long, value_name = "PATH")]
-    pub path: PathBuf,
+    /// Fixture files or directories (searched recursively), all run in one process.
+    #[arg(value_name = "PATH", required_unless_present = "path")]
+    pub paths: Vec<PathBuf>,
+
+    /// A fixture file or directory, run together with any PATH; may repeat.
+    #[arg(short, long, value_name = "PATH", action = ArgAction::Append)]
+    pub path: Vec<PathBuf>,
 
     /// Number of fixture files to run at once.
     #[arg(short, long, default_value_t = 1)]
@@ -51,6 +56,11 @@ pub struct RunnerArgs {
 }
 
 impl RunnerArgs {
+    /// Every fixture path given, by `--path` or as an argument.
+    pub fn fixture_paths(&self) -> impl Iterator<Item = &Path> {
+        self.path.iter().chain(&self.paths).map(PathBuf::as_path)
+    }
+
     pub fn selects(&self, fixture_name: &str) -> bool {
         self.run.as_ref().is_none_or(|re| re.is_match(fixture_name))
     }
@@ -99,29 +109,43 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
         .unwrap_or_else(|| "panicked".to_string())
 }
 
-/// All `.json` files under `path`, or `path` itself if it is a file.
-pub fn collect_json_files(path: &Path) -> Vec<PathBuf> {
-    if path.is_file() {
-        return vec![path.to_path_buf()];
-    }
+/// Every path that is a file, and every `.json` file under the paths that are
+/// directories, sorted and each once. A path that does not exist, or a directory
+/// that cannot be read, is an error rather than no fixtures.
+pub fn collect_json_files<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
-    let mut dirs = vec![path.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            eprintln!("cannot read directory {}", dir.display());
+    for path in paths {
+        if path.is_file() {
+            files.push(path.to_path_buf());
             continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                dirs.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "json") {
-                files.push(path);
+        }
+        if !path.is_dir() {
+            return Err(format!(
+                "no such fixture file or directory: {}",
+                path.display()
+            ));
+        }
+        let mut dirs = vec![path.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .map_err(|e| format!("cannot read directory {}: {e}", dir.display()))?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "json") {
+                    files.push(path);
+                }
             }
         }
     }
+    // A file named twice, or also found under a directory given, runs once.
+    let mut seen = HashSet::new();
+    files.retain(|file| seen.insert(file.canonicalize().unwrap_or_else(|_| file.clone())));
     files.sort();
-    files
+    Ok(files)
 }
 
 /// Run `run_file` over every file from `workers` threads, returning the results
@@ -423,6 +447,28 @@ mod tests {
                 line(path, reason) + &line("sequential", "bad-access-list")
             );
         }
+    }
+
+    fn paths(args: &[&str]) -> Result<Vec<PathBuf>, clap::Error> {
+        let cli = Cli::try_parse_from([&["runner"], args].concat())?;
+        Ok(cli.runner.fixture_paths().map(Path::to_path_buf).collect())
+    }
+
+    #[test]
+    fn takes_any_number_of_fixture_paths() {
+        assert_eq!(
+            paths(&["a.json", "dir", "-p", "b", "--path", "c"]).unwrap(),
+            ["b", "c", "a.json", "dir"].map(PathBuf::from)
+        );
+        assert_eq!(paths(&["--path", "dir"]).unwrap(), [PathBuf::from("dir")]);
+        assert!(paths(&["--json"]).is_err());
+    }
+
+    #[test]
+    fn a_missing_fixture_path_is_an_error() {
+        let missing = Path::new("no/such/fixtures");
+        let err = collect_json_files([missing]).unwrap_err();
+        assert!(err.contains("no/such/fixtures"), "{err}");
     }
 
     #[test]
