@@ -48,10 +48,11 @@ make test-levm
 `blocktest` and `enginetest` run fixtures from any directory and print one result per fixture, which is how EELS `consume direct` calls them. From `tooling/`:
 
 ```sh
-cargo run --profile release-fast -p ef_tests-runners --bin blocktest -- --path <fixtures> [--workers N] [--run REGEX] [--json] [--no-bal-parallel-exec] [--bal-report]
-cargo run --profile release-fast -p ef_tests-runners --bin enginetest -- --path <fixtures> [same flags]
+cargo run --profile release-fast -p ef_tests-runners --bin blocktest -- <path>... [--workers N] [--run REGEX] [--json] [--no-bal-parallel-exec] [--bal-report]
+cargo run --profile release-fast -p ef_tests-runners --bin enginetest -- <path>... [same flags]
 ```
 
+- Each `<path>` is a fixture file or a directory searched recursively for `.json` files; all of them run in one process and print one set of results. `-p/--path <path>` still works and may repeat. A path that does not exist is an error. Both runners exit non-zero when any fixture fails.
 - `blocktest` imports each `blockchain_test` block through the blockchain ef_tests harness, handing it the fixture's `blockAccessList` (or `rlp_decoded.blockAccessList` for a block expected to be invalid) when the keccak of its RLP, in the order given, equals `blockAccessListHash`. A list that does not match or does not parse is dropped, as full sync drops a peer's, and the block runs without it.
 - `enginetest` sends each `blockchain_test_engine` payload and forkchoice update to ethrex's own `engine_newPayloadV<n>` and `engine_forkchoiceUpdatedV<n>` handlers, in process.
 - ethrex's `statetest` is `ef_tests-statev2 statetest` (see `tooling/ef_tests/state_v2`).

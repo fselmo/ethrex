@@ -29,7 +29,13 @@ fn main() -> ExitCode {
     install_bal_report(&cli.runner);
     let started = Instant::now();
     let rt = tokio::runtime::Runtime::new().expect("failed to build the tokio runtime");
-    let files = collect_json_files(&cli.runner.path);
+    let files = match collect_json_files(cli.runner.fixture_paths()) {
+        Ok(files) => files,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let results = run_files(&files, cli.runner.workers, |file| {
         run_file(file, &cli.runner, &rt)
     });
