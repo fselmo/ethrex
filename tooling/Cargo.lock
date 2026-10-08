@@ -2948,6 +2948,7 @@ dependencies = [
  "clap 4.6.0",
  "ef_tests-blockchain",
  "ef_tests-engine",
+ "ethrex-storage 29.0.1",
  "ethrex-vm",
  "regex",
  "serde",

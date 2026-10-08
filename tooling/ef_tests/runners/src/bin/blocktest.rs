@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::Parser;
-use ef_tests_blockchain::test_runner::{RunOptions, SKIPPED_TESTS, run_ef_test, skip_reason};
+use ef_tests_blockchain::test_runner::{SKIPPED_TESTS, run_ef_test, skip_reason};
 use ef_tests_blockchain::types::TestUnit;
 use ef_tests_runners::{
     FixtureResult, RunnerArgs, collect_json_files, install_bal_report, report, run_files,
@@ -55,9 +55,7 @@ fn run_file(file: &Path, args: &RunnerArgs, rt: &tokio::runtime::Runtime) -> Vec
     };
     let mut tests: Vec<_> = tests.into_iter().collect();
     tests.sort_by(|a, b| a.0.cmp(&b.0));
-    let options = RunOptions {
-        bal_parallel_exec: !args.no_bal_parallel_exec,
-    };
+    let options = args.blocktest_options();
     tests
         .into_iter()
         .filter(|(name, test)| {

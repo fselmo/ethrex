@@ -50,6 +50,11 @@ pub struct RunnerArgs {
     #[arg(long, env = "ETHREX_NO_BAL_PARALLEL_EXEC")]
     pub no_bal_parallel_exec: bool,
 
+    /// Run without the per-block precompile result cache, as the node flag of the same
+    /// name does.
+    #[arg(long, env = "ETHREX_NO_PRECOMPILE_CACHE")]
+    pub no_precompile_cache: bool,
+
     /// Print the executor chosen for each block as one JSON line on stderr.
     #[arg(long)]
     pub bal_report: bool,
@@ -63,6 +68,23 @@ impl RunnerArgs {
 
     pub fn selects(&self, fixture_name: &str) -> bool {
         self.run.as_ref().is_none_or(|re| re.is_match(fixture_name))
+    }
+
+    /// How `blocktest` executes each fixture's blocks.
+    pub fn blocktest_options(&self) -> ef_tests_blockchain::test_runner::RunOptions {
+        ef_tests_blockchain::test_runner::RunOptions {
+            bal_parallel_exec: !self.no_bal_parallel_exec,
+            precompile_cache: !self.no_precompile_cache,
+        }
+    }
+
+    /// How `enginetest` executes each fixture's payloads.
+    pub fn enginetest_options(&self) -> ef_tests_engine::RunOptions {
+        ef_tests_engine::RunOptions {
+            bal_parallel_exec: !self.no_bal_parallel_exec,
+            precompile_cache: !self.no_precompile_cache,
+            ..ef_tests_engine::RunOptions::from_env()
+        }
     }
 }
 
@@ -361,6 +383,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use clap::Parser;
+    use ef_tests_blockchain::test_runner::fixture_blockchain;
+    use ef_tests_engine::EngineApiHarness;
+    use ethrex_storage::{EngineType, Store};
 
     use super::*;
 
@@ -507,6 +532,40 @@ mod tests {
         let missing = Path::new("no/such/fixtures");
         let err = collect_json_files([missing]).unwrap_err();
         assert!(err.contains("no/such/fixtures"), "{err}");
+    }
+
+    /// Each switch reaches the `Blockchain` both runners import blocks with, which
+    /// reads it whenever it executes a block.
+    #[tokio::test]
+    async fn switches_reach_the_blockchain() {
+        const GENESIS: &str = include_str!("../../../../fixtures/genesis/l1.json");
+        for (args, bal_parallel_exec, precompile_cache) in [
+            (&[][..], true, true),
+            (&["--no-bal-parallel-exec"][..], false, true),
+            (&["--no-precompile-cache"][..], true, false),
+        ] {
+            let cli = Cli::try_parse_from([&["runner", "fixtures"], args].concat())
+                .expect("valid arguments");
+            let store = Store::new("", EngineType::InMemory).expect("in-memory store");
+            let blockchain = fixture_blockchain(store, &cli.runner.blocktest_options());
+            let genesis = serde_json::from_str(GENESIS).expect("genesis parses");
+            let harness = EngineApiHarness::from_genesis(genesis, &cli.runner.enginetest_options())
+                .await
+                .expect("harness builds");
+            for (runner, options) in [
+                ("blocktest", &blockchain.options),
+                ("enginetest", &harness.ctx.blockchain.options),
+            ] {
+                assert_eq!(
+                    (
+                        options.bal_parallel_exec_enabled,
+                        options.precompile_cache_enabled
+                    ),
+                    (bal_parallel_exec, precompile_cache),
+                    "{runner} {args:?}: (bal_parallel_exec, precompile_cache)"
+                );
+            }
+        }
     }
 
     #[test]

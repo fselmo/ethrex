@@ -63,14 +63,26 @@ pub struct RunOptions {
     /// Run blocks that carry an access list on the BAL-driven parallel executor,
     /// as a node does unless started with `--no-bal-parallel-exec`.
     pub bal_parallel_exec: bool,
+    /// Cache precompile results within a block, as a node does unless started with
+    /// `--no-precompile-cache`.
+    pub precompile_cache: bool,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
         Self {
             bal_parallel_exec: true,
+            precompile_cache: true,
         }
     }
+}
+
+/// The `Blockchain` a fixture's blocks are imported with, set up as `options` say.
+pub fn fixture_blockchain(store: Store, options: &RunOptions) -> Blockchain {
+    let mut blockchain = Blockchain::for_test_harness_with_pool(store, merkle_pool());
+    blockchain.options.bal_parallel_exec_enabled = options.bal_parallel_exec;
+    blockchain.options.precompile_cache_enabled = options.precompile_cache;
+    blockchain
 }
 
 /// A block the client rejected.
@@ -194,8 +206,7 @@ pub async fn run_ef_test(
     check_prestate_against_db(test_key, test, &store);
 
     // Blockchain EF tests are meant for L1.
-    let mut blockchain = Blockchain::for_test_harness_with_pool(store.clone(), merkle_pool());
-    blockchain.options.bal_parallel_exec_enabled = options.bal_parallel_exec;
+    let blockchain = fixture_blockchain(store.clone(), options);
 
     // Early return if the exception is in the rlp decoding of the block
     for (index, bf) in test.blocks.iter().enumerate() {
