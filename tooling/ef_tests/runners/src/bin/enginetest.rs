@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::Parser;
-use ef_tests_engine::{EngineFixtureFile, RunOptions, run_fixture};
+use ef_tests_engine::{EngineFixtureFile, run_fixture};
 use ef_tests_runners::{
     FixtureResult, RunnerArgs, collect_json_files, install_bal_report, report, run_files,
 };
@@ -53,10 +53,7 @@ fn run_file(file: &Path, args: &RunnerArgs, rt: &tokio::runtime::Runtime) -> Vec
             return vec![FixtureResult::new(name, String::new(), Some(e))];
         }
     };
-    let opts = RunOptions {
-        bal_parallel_exec: !args.no_bal_parallel_exec,
-        ..RunOptions::from_env()
-    };
+    let opts = args.enginetest_options();
     let mut results = Vec::new();
     for (name, fixture) in fixtures.iter().filter(|(name, _)| args.selects(name)) {
         let mut rejections = Vec::new();
