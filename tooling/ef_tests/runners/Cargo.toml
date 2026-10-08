@@ -19,6 +19,9 @@ tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+ethrex-storage.workspace = true
+
 [features]
 default = ["c-kzg"]
 c-kzg = ["ef_tests-blockchain/c-kzg", "ef_tests-engine/c-kzg"]
