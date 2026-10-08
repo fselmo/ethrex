@@ -237,11 +237,11 @@ pub async fn run_ef_test(
     // home for this check.
     // Only needed when the fixture delivers no access lists: otherwise `run` has
     // already executed every block in parallel on the fixture's own lists. Skipped
-    // when parallel execution is off, since pass 2 would run it anyway.
+    // when parallel execution is off, since pass 2 would then run sequentially too.
     #[cfg(not(feature = "stateless"))]
     if test.network == Fork::Amsterdam && options.bal_parallel_exec && !delivers_access_lists(test)
     {
-        run_two_pass_parallel(test_key, test).await?;
+        run_two_pass_parallel(test_key, test, options).await?;
     }
 
     // Run stateless if backend was specified for this.
@@ -413,12 +413,17 @@ fn delivers_access_lists(test: &TestUnit) -> bool {
 /// Pass 1 (sequential): runs every block with `add_block_pipeline_bal` to collect the
 /// BAL that each block produces.  Pass 2 (parallel): creates a fresh chain and re-runs every
 /// block passing the corresponding BAL so the BAL-warmed parallel path is exercised.  The final
-/// post-state of pass 2 must match the expected post-state.
+/// post-state of pass 2 must match the expected post-state. Both chains run with
+/// `options`, like the one `run` imports with.
 #[cfg(not(feature = "stateless"))]
-async fn run_two_pass_parallel(test_key: &str, test: &TestUnit) -> Result<(), String> {
+async fn run_two_pass_parallel(
+    test_key: &str,
+    test: &TestUnit,
+    options: &RunOptions,
+) -> Result<(), String> {
     // ---- Pass 1: sequential, collect BALs ----
     let store1 = build_store_for_test(test).await;
-    let blockchain1 = Blockchain::for_test_harness_with_pool(store1.clone(), merkle_pool());
+    let blockchain1 = fixture_blockchain(store1.clone(), options);
 
     let mut bals: Vec<Arc<BlockAccessList>> = Vec::with_capacity(test.blocks.len());
 
@@ -450,7 +455,7 @@ async fn run_two_pass_parallel(test_key: &str, test: &TestUnit) -> Result<(), St
 
     // ---- Pass 2: parallel (BAL-driven), verify post-state ----
     let store2 = build_store_for_test(test).await;
-    let blockchain2 = Blockchain::for_test_harness_with_pool(store2.clone(), merkle_pool());
+    let blockchain2 = fixture_blockchain(store2.clone(), options);
 
     for (block_fixture, bal) in test.blocks.iter().zip(bals.iter()) {
         let block: CoreBlock = block_fixture.block().unwrap().clone().into();
