@@ -1,10 +1,12 @@
 //! `--bal-report` prints the executor ethrex chose for each block, read from the
-//! event the client emits, and `--no-bal-parallel-exec` reaches that choice.
+//! event the client emits, and `--no-bal-parallel-exec` and `--bal-withhold` reach
+//! that choice.
 //!
 //! The fixtures are one Amsterdam block each, from execution-specs:
 //! `test_bal_post_execution_calls_net_storage_at_last_index` (valid, with its
 //! access list) and `test_bal_invalid_missing_system_contract_entry`
 //! (`history_storage`), whose header commits to a list execution does not match.
+//! `blocktest_mismatched_list.json` is the latter's tests@v21.0.1 `blockchain_test`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -94,6 +96,34 @@ fn blocktest_reports_a_dropped_list() {
             expected(VALID_BLOCK, "sequential", "bad-access-list")
         );
     }
+}
+
+/// A withheld block prints one line: the path of the two-pass check's run on the
+/// list the import built, or `sequential` when no such run follows.
+#[test]
+fn blocktest_reports_a_withheld_list() {
+    let bin = env!("CARGO_BIN_EXE_blocktest");
+    let fixture = fixture("blocktest_bal_report.json");
+    assert_eq!(
+        bal_report(bin, &fixture, &["--bal-withhold"]),
+        expected(VALID_BLOCK, "parallel", "withheld")
+    );
+    assert_eq!(
+        bal_report(bin, &fixture, &["--bal-withhold", "--no-bal-parallel-exec"]),
+        expected(VALID_BLOCK, "sequential", "withheld")
+    );
+}
+
+/// A block the fixture expects to be rejected is not run again, so its one line is
+/// the import's.
+#[test]
+fn blocktest_reports_a_withheld_rejected_block() {
+    let bin = env!("CARGO_BIN_EXE_blocktest");
+    let fixture = fixture("blocktest_mismatched_list.json");
+    assert_eq!(
+        bal_report(bin, &fixture, &["--bal-withhold"]),
+        expected(MISMATCHED_BLOCK, "sequential", "withheld")
+    );
 }
 
 #[test]
