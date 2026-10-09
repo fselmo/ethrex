@@ -10,7 +10,7 @@ use clap::Parser;
 use ef_tests_blockchain::test_runner::{SKIPPED_TESTS, run_ef_test, skip_reason};
 use ef_tests_blockchain::types::TestUnit;
 use ef_tests_runners::{
-    FixtureResult, RunnerArgs, collect_json_files, install_bal_report, report, run_files,
+    BlocktestArgs, FixtureResult, collect_json_files, install_bal_report, report, run_files,
 };
 
 #[derive(Parser, Debug)]
@@ -21,28 +21,29 @@ use ef_tests_runners::{
 )]
 struct Cli {
     #[command(flatten)]
-    runner: RunnerArgs,
+    args: BlocktestArgs,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    install_bal_report(&cli.runner);
+    let runner = &cli.args.runner;
+    install_bal_report(runner);
     let started = Instant::now();
     let rt = tokio::runtime::Runtime::new().expect("failed to build the tokio runtime");
-    let files = match collect_json_files(cli.runner.fixture_paths()) {
+    let files = match collect_json_files(runner.fixture_paths()) {
         Ok(files) => files,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let results = run_files(&files, cli.runner.workers, |file| {
-        run_file(file, &cli.runner, &rt)
+    let results = run_files(&files, runner.workers, |file| {
+        run_file(file, &cli.args, &rt)
     });
-    report(&results, cli.runner.json, started)
+    report(&results, runner.json, started)
 }
 
-fn run_file(file: &Path, args: &RunnerArgs, rt: &tokio::runtime::Runtime) -> Vec<FixtureResult> {
+fn run_file(file: &Path, args: &BlocktestArgs, rt: &tokio::runtime::Runtime) -> Vec<FixtureResult> {
     let tests: HashMap<String, TestUnit> = match std::fs::read_to_string(file)
         .map_err(|e| e.to_string())
         .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
@@ -59,7 +60,7 @@ fn run_file(file: &Path, args: &RunnerArgs, rt: &tokio::runtime::Runtime) -> Vec
     tests
         .into_iter()
         .filter(|(name, test)| {
-            args.selects(name) && skip_reason(name, test, Some(SKIPPED_TESTS)).is_none()
+            args.runner.selects(name) && skip_reason(name, test, Some(SKIPPED_TESTS)).is_none()
         })
         .map(|(name, test)| {
             let mut rejections = Vec::new();

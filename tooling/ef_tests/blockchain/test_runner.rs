@@ -66,6 +66,9 @@ pub struct RunOptions {
     /// Cache precompile results within a block, as a node does unless started with
     /// `--no-precompile-cache`.
     pub precompile_cache: bool,
+    /// Import every block without the access list its fixture delivers, so the client
+    /// runs it sequentially and checks the list it builds against the header.
+    pub withhold_access_lists: bool,
 }
 
 impl Default for RunOptions {
@@ -73,6 +76,7 @@ impl Default for RunOptions {
         Self {
             bal_parallel_exec: true,
             precompile_cache: true,
+            withhold_access_lists: false,
         }
     }
 }
@@ -225,7 +229,7 @@ pub async fn run_ef_test(
         }
     }
 
-    run(test_key, test, &blockchain, &store, rejections).await?;
+    run(test_key, test, &blockchain, &store, options, rejections).await?;
 
     // For Amsterdam tests, exercise the parallel BAL execution path as a correctness check.
     // Two-pass approach: pass 1 collects the BAL produced by sequential execution, pass 2
@@ -235,12 +239,8 @@ pub async fn run_ef_test(
     // and doesn't drive `add_block_pipeline`, and BAL-warmed parallel execution gives no
     // benefit in single-threaded zkVM guest builds. The non-stateless runs are the right
     // home for this check.
-    // Only needed when the fixture delivers no access lists: otherwise `run` has
-    // already executed every block in parallel on the fixture's own lists. Skipped
-    // when parallel execution is off, since pass 2 would then run sequentially too.
     #[cfg(not(feature = "stateless"))]
-    if test.network == Fork::Amsterdam && options.bal_parallel_exec && !delivers_access_lists(test)
-    {
+    if runs_two_pass(test, options) {
         run_two_pass_parallel(test_key, test, options).await?;
     }
 
@@ -278,8 +278,15 @@ async fn run(
     test: &TestUnit,
     blockchain: &Blockchain,
     store: &Store,
+    options: &RunOptions,
     rejections: &mut Vec<Rejection>,
 ) -> Result<(), String> {
+    // A withheld block's report line waits for the two-pass check to run the block
+    // again, which happens only once every block is imported, and never when a block
+    // expects an exception, since the check then stops at that block.
+    let reruns =
+        runs_two_pass(test, options) && test.blocks.iter().all(|b| b.expect_exception.is_none());
+
     // Execute all blocks in test
     for (index, block_fixture) in test.blocks.iter().enumerate() {
         let expects_exception = block_fixture.expect_exception.is_some();
@@ -287,10 +294,18 @@ async fn run(
         // Won't panic because test has been validated
         let block: CoreBlock = block_fixture.block().unwrap().clone().into();
         let hash = block.hash();
-        let bal = delivered_access_list(block_fixture.block_access_list(), &block);
+        let bal = if options.withhold_access_lists {
+            report_withheld(options, "import", &block);
+            None
+        } else {
+            delivered_access_list(block_fixture.block_access_list(), &block)
+        };
 
         // Attempt to add the block as the head of the chain
         let chain_result = blockchain.add_block_pipeline(block.clone(), bal);
+        if chain_result.is_err() || !reruns {
+            report_withheld(options, "done", &block);
+        }
 
         match chain_result {
             Err(error) => {
@@ -300,6 +315,9 @@ async fn run(
                     error: error.to_string(),
                 });
                 if !expects_exception {
+                    if reruns {
+                        report_withheld_done(options, &test.blocks[..index]);
+                    }
                     return Err(format!(
                         "Transaction execution unexpectedly failed on test: {test_key}, with error {error:?}",
                     ));
@@ -340,6 +358,35 @@ async fn run(
 /// Tracing target of the event the runner emits when it drops a delivered access
 /// list, so a report can tell a dropped list from none.
 pub const DROPPED_ACCESS_LIST_TARGET: &str = "ef_tests::dropped_access_list";
+
+/// Tracing target of the events the runner emits about a block whose access list it
+/// withheld, so a report can print one line for the block once its outcome is known.
+/// `step` is `import` before the import runs the block, `collect` before the two-pass
+/// check runs it again only to collect its list, `rerun` before the check runs it on
+/// that list, `rejected` (with `error`) when that run rejects it, and `done` when no
+/// such run will follow.
+pub const WITHHELD_ACCESS_LIST_TARGET: &str = "ef_tests::withheld_access_list";
+
+/// Tell a report that the runner, withholding access lists, has reached `step` for
+/// `block`.
+fn report_withheld(options: &RunOptions, step: &str, block: &CoreBlock) {
+    if options.withhold_access_lists {
+        tracing::debug!(
+            target: WITHHELD_ACCESS_LIST_TARGET,
+            block = block.header.number,
+            hash = %format_args!("{:#x}", block.hash()),
+            step,
+            "Withheld access list"
+        );
+    }
+}
+
+/// Tell a report that the two-pass check will not run `blocks` again.
+fn report_withheld_done(options: &RunOptions, blocks: &[BlockWithRLP]) {
+    for block in blocks.iter().filter_map(BlockWithRLP::block) {
+        report_withheld(options, "done", &block.clone().into());
+    }
+}
 
 /// The access list the fixture delivers with `block`, if the header commits to it.
 ///
@@ -399,8 +446,19 @@ pub fn hash_as_delivered(bal: &BlockAccessList) -> H256 {
     keccak(accounts.encode_to_vec())
 }
 
+/// Whether the two-pass check runs after the import, because the import ran the
+/// blocks without access lists: the fixture delivers none or the runner withheld them.
+/// Otherwise the import has already executed every block in parallel on the fixture's
+/// own lists. Never when parallel execution is off, since pass 2 would then run
+/// sequentially too.
+fn runs_two_pass(test: &TestUnit, options: &RunOptions) -> bool {
+    cfg!(not(feature = "stateless"))
+        && test.network == Fork::Amsterdam
+        && options.bal_parallel_exec
+        && (options.withhold_access_lists || !delivers_access_lists(test))
+}
+
 /// Whether any block of the fixture carries its access list.
-#[cfg(not(feature = "stateless"))]
 fn delivers_access_lists(test: &TestUnit) -> bool {
     test.blocks.iter().any(|b| {
         b.block()
@@ -436,20 +494,28 @@ async fn run_two_pass_parallel(
         let block: CoreBlock = block_fixture.block().unwrap().clone().into();
         let hash = block.hash();
 
+        report_withheld(options, "collect", &block);
         let produced_bal = blockchain1
             .add_block_pipeline_bal(block, None)
-            .map_err(|e| format!("Two-pass pass-1 failed for test {test_key}: {e:?}"))?;
+            .map_err(|e| {
+                report_withheld_done(options, &test.blocks);
+                format!("Two-pass pass-1 failed for test {test_key}: {e:?}")
+            })?;
 
         apply_fork_choice(&store1, hash, hash, hash, None)
             .await
             .map_err(|e| {
+                report_withheld_done(options, &test.blocks);
                 format!("Two-pass pass-1 fork choice failed for test {test_key}: {e:?}")
             })?;
 
         // If execution produced no BAL (non-Amsterdam block in a transition test), skip pass 2.
         match produced_bal {
             Some(bal) => bals.push(Arc::new(bal)),
-            None => return Ok(()),
+            None => {
+                report_withheld_done(options, &test.blocks);
+                return Ok(());
+            }
         }
     }
 
@@ -457,17 +523,32 @@ async fn run_two_pass_parallel(
     let store2 = build_store_for_test(test).await;
     let blockchain2 = fixture_blockchain(store2.clone(), options);
 
-    for (block_fixture, bal) in test.blocks.iter().zip(bals.iter()) {
+    for (index, (block_fixture, bal)) in test.blocks.iter().zip(bals.iter()).enumerate() {
         let block: CoreBlock = block_fixture.block().unwrap().clone().into();
         let hash = block.hash();
 
-        blockchain2
-            .add_block_pipeline(block, Some(Arc::clone(bal)))
-            .map_err(|e| format!("Two-pass pass-2 (parallel) failed for test {test_key}: {e:?}"))?;
+        report_withheld(options, "rerun", &block);
+        if let Err(e) = blockchain2.add_block_pipeline(block.clone(), Some(Arc::clone(bal))) {
+            if options.withhold_access_lists {
+                tracing::debug!(
+                    target: WITHHELD_ACCESS_LIST_TARGET,
+                    block = block.header.number,
+                    hash = %format_args!("{hash:#x}"),
+                    step = "rejected",
+                    error = %e,
+                    "Withheld access list"
+                );
+                report_withheld_done(options, &test.blocks[index + 1..]);
+            }
+            return Err(format!(
+                "Two-pass pass-2 (parallel) failed for test {test_key}: {e:?}"
+            ));
+        }
 
         apply_fork_choice(&store2, hash, hash, hash, None)
             .await
             .map_err(|e| {
+                report_withheld_done(options, &test.blocks[index + 1..]);
                 format!("Two-pass pass-2 fork choice failed for test {test_key}: {e:?}")
             })?;
     }
