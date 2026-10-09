@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use clap::ArgAction;
-use ef_tests_blockchain::test_runner::DROPPED_ACCESS_LIST_TARGET;
+use ef_tests_blockchain::test_runner::{DROPPED_ACCESS_LIST_TARGET, WITHHELD_ACCESS_LIST_TARGET};
 use ethrex_vm::BAL_EXECUTION_TARGET;
 use regex::Regex;
 use serde::Serialize;
@@ -70,20 +70,36 @@ impl RunnerArgs {
         self.run.as_ref().is_none_or(|re| re.is_match(fixture_name))
     }
 
-    /// How `blocktest` executes each fixture's blocks.
-    pub fn blocktest_options(&self) -> ef_tests_blockchain::test_runner::RunOptions {
-        ef_tests_blockchain::test_runner::RunOptions {
-            bal_parallel_exec: !self.no_bal_parallel_exec,
-            precompile_cache: !self.no_precompile_cache,
-        }
-    }
-
     /// How `enginetest` executes each fixture's payloads.
     pub fn enginetest_options(&self) -> ef_tests_engine::RunOptions {
         ef_tests_engine::RunOptions {
             bal_parallel_exec: !self.no_bal_parallel_exec,
             precompile_cache: !self.no_precompile_cache,
             ..ef_tests_engine::RunOptions::from_env()
+        }
+    }
+}
+
+/// Options `blocktest` takes.
+#[derive(clap::Args, Debug)]
+pub struct BlocktestArgs {
+    #[command(flatten)]
+    pub runner: RunnerArgs,
+
+    /// Import every block without its access list, so ethrex runs it sequentially and
+    /// checks the list it builds against the header, then run it again in parallel on
+    /// that list.
+    #[arg(long)]
+    pub bal_withhold: bool,
+}
+
+impl BlocktestArgs {
+    /// How `blocktest` executes each fixture's blocks.
+    pub fn blocktest_options(&self) -> ef_tests_blockchain::test_runner::RunOptions {
+        ef_tests_blockchain::test_runner::RunOptions {
+            bal_parallel_exec: !self.runner.no_bal_parallel_exec,
+            precompile_cache: !self.runner.no_precompile_cache,
+            withhold_access_lists: self.bal_withhold,
         }
     }
 }
@@ -277,6 +293,13 @@ pub fn report(results: &[FixtureResult], json: bool, started: Instant) -> ExitCo
 /// `reason` is `bad-access-list` for a block whose delivered list the runner dropped
 /// (the client then sees no list, so it would say `no-access-list`). Otherwise it is
 /// empty for `parallel`, and for `sequential` the first gate that ruled parallel out.
+///
+/// A block the runner imported without its list (`--bal-withhold`) also gets one line,
+/// with `reason` `withheld`, printed once its outcome is known: with the `path` of the
+/// two-pass check's parallel run when that runs it, and `sequential` otherwise. When
+/// that run rejects a block the import accepted, a
+/// `{"event":"balFallback","block":N,"hash":"0x…","parallelError":"…","sequentialResult":"valid","sequentialError":""}`
+/// line follows.
 /// Without the flag no subscriber is installed.
 pub fn install_bal_report(args: &RunnerArgs) {
     if let Some(layer) = bal_report_layer(args, std::io::stderr) {
@@ -291,11 +314,12 @@ where
 {
     let filter = Targets::new()
         .with_target(BAL_EXECUTION_TARGET, Level::DEBUG)
-        .with_target(DROPPED_ACCESS_LIST_TARGET, Level::DEBUG);
+        .with_target(DROPPED_ACCESS_LIST_TARGET, Level::DEBUG)
+        .with_target(WITHHELD_ACCESS_LIST_TARGET, Level::DEBUG);
     args.bal_report.then(|| {
         BalExecutionReport {
             writer,
-            dropped: Mutex::default(),
+            pending: Mutex::default(),
         }
         .with_filter(filter)
     })
@@ -303,8 +327,44 @@ where
 
 struct BalExecutionReport<W> {
     writer: W,
-    /// Delivered lists the runner dropped whose blocks have not run yet, by block hash.
-    dropped: Mutex<HashMap<String, usize>>,
+    pending: Mutex<Pending>,
+}
+
+#[derive(Default)]
+struct Pending {
+    /// The runner's events waiting for their block's line, by kind and block hash.
+    events: HashMap<(&'static str, String), usize>,
+    /// Lines of withheld blocks waiting for the block's outcome, by block hash.
+    held: HashMap<String, Vec<BalExecution>>,
+}
+
+impl Pending {
+    fn add(&mut self, kind: &'static str, hash: String) {
+        *self.events.entry((kind, hash)).or_default() += 1;
+    }
+
+    /// Use up one of the `kind` events waiting for the block `hash`, if any.
+    fn take(&mut self, kind: &'static str, hash: &str) -> bool {
+        let key = (kind, hash.to_string());
+        let Some(count) = self.events.get_mut(&key) else {
+            return false;
+        };
+        *count -= 1;
+        if *count == 0 {
+            self.events.remove(&key);
+        }
+        true
+    }
+
+    /// One held line of the block `hash`, if any.
+    fn release(&mut self, hash: &str) -> Option<BalExecution> {
+        let lines = self.held.get_mut(hash)?;
+        let line = lines.pop();
+        if lines.is_empty() {
+            self.held.remove(hash);
+        }
+        line
+    }
 }
 
 impl<S, W> Layer<S> for BalExecutionReport<W>
@@ -318,28 +378,77 @@ where
             ..Default::default()
         };
         event.record(&mut line);
-        let mut dropped = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
-        if event.metadata().target() == DROPPED_ACCESS_LIST_TARGET {
-            *dropped.entry(line.hash).or_default() += 1;
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let target = event.metadata().target();
+        if target == DROPPED_ACCESS_LIST_TARGET {
+            pending.add("dropped", line.hash);
+            return;
+        }
+        // A withheld block runs up to three times: the import, the two-pass check's
+        // run that only collects its list, and the check's run on that list. The
+        // import's line is held until the runner says which run decides the block.
+        if target == WITHHELD_ACCESS_LIST_TARGET {
+            match line.step.as_str() {
+                "import" => pending.add("import", line.hash),
+                "collect" => pending.add("collect", line.hash),
+                "rerun" => {
+                    pending.release(&line.hash);
+                    pending.add("rerun", line.hash);
+                }
+                "done" => match pending.release(&line.hash) {
+                    Some(held) => self.write(&held),
+                    // The import rejected the block before executing it.
+                    None => {
+                        pending.take("import", &line.hash);
+                    }
+                },
+                "rejected" => self.write(&BalFallback {
+                    event: "balFallback",
+                    block: line.block,
+                    hash: &line.hash,
+                    parallel_error: &line.error,
+                    sequential_result: "valid",
+                    sequential_error: "",
+                }),
+                _ => {}
+            }
             return;
         }
         // Execution runs on a thread of its own, so the event can't be tied to the
-        // import that dropped the list; the hash and the client's reason can. A block
-        // whose list was dropped reaches the client with none, and ethrex's first gate
-        // (with rayon) is the access list, so it always says `no-access-list`. Another
-        // worker may run the same block with its list at the same time (a fixture and
-        // its clean twin), and its event, which names any other reason, is left alone.
-        if line.reason == "no-access-list"
-            && let Some(pending) = dropped.get_mut(&line.hash)
-        {
-            *pending -= 1;
-            if *pending == 0 {
-                dropped.remove(&line.hash);
+        // import that dropped or withheld the list; the hash and the client's reason
+        // can. Such a block reaches the client with no list, and ethrex's first gate
+        // (with rayon) is the access list, so it always says `no-access-list`, as does
+        // the run that collects a withheld block's list. Another worker may run the
+        // same block with its list at the same time (a fixture and its clean twin),
+        // and its event, which names any other reason, is left alone.
+        if line.reason == "no-access-list" {
+            if pending.take("import", &line.hash) {
+                line.reason = "withheld".to_string();
+                pending
+                    .held
+                    .entry(line.hash.clone())
+                    .or_default()
+                    .push(line);
+                return;
+            } else if pending.take("collect", &line.hash) {
+                return;
+            } else if pending.take("dropped", &line.hash) {
+                line.reason = "bad-access-list".to_string();
             }
-            line.reason = "bad-access-list".to_string();
+        } else if pending.take("rerun", &line.hash) {
+            line.reason = "withheld".to_string();
         }
-        drop(dropped);
-        if let Ok(mut line) = serde_json::to_string(&line) {
+        drop(pending);
+        self.write(&line);
+    }
+}
+
+impl<W> BalExecutionReport<W>
+where
+    W: for<'a> MakeWriter<'a> + 'static,
+{
+    fn write(&self, line: &impl Serialize) {
+        if let Ok(mut line) = serde_json::to_string(line) {
             line.push('\n');
             // One write per line, so lines from different workers don't interleave.
             let _ = self.writer.make_writer().write_all(line.as_bytes());
@@ -354,6 +463,22 @@ struct BalExecution {
     hash: String,
     path: String,
     reason: String,
+    /// The runner's events only.
+    #[serde(skip)]
+    step: String,
+    #[serde(skip)]
+    error: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BalFallback<'a> {
+    event: &'static str,
+    block: u64,
+    hash: &'a str,
+    parallel_error: &'a str,
+    sequential_result: &'static str,
+    sequential_error: &'static str,
 }
 
 impl Visit for BalExecution {
@@ -367,13 +492,16 @@ impl Visit for BalExecution {
         match field.name() {
             "path" => self.path = value.to_string(),
             "reason" => self.reason = value.to_string(),
+            "step" => self.step = value.to_string(),
             _ => {}
         }
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "hash" {
-            self.hash = format!("{value:?}");
+        match field.name() {
+            "hash" => self.hash = format!("{value:?}"),
+            "error" => self.error = format!("{value:?}"),
+            _ => {}
         }
     }
 }
@@ -393,6 +521,12 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         runner: RunnerArgs,
+    }
+
+    #[derive(Parser)]
+    struct BlocktestCli {
+        #[command(flatten)]
+        args: BlocktestArgs,
     }
 
     #[derive(Clone, Default)]
@@ -417,9 +551,14 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
     enum Event {
         /// The runner dropped the block's delivered list.
         Dropped,
+        /// The runner, withholding the block's list, reached this step.
+        Withheld(&'static str),
+        /// The two-pass check's run on the list rejected the withheld block.
+        Rejected,
         /// The client ran the block on `path` for `reason`.
         Executed(&'static str, &'static str),
     }
@@ -439,6 +578,21 @@ mod tests {
                         target: DROPPED_ACCESS_LIST_TARGET,
                         hash = %"0x01",
                         "Dropping the delivered access list"
+                    ),
+                    Event::Withheld(step) => tracing::debug!(
+                        target: WITHHELD_ACCESS_LIST_TARGET,
+                        block = 1u64,
+                        hash = %"0x01",
+                        step,
+                        "Withheld access list"
+                    ),
+                    Event::Rejected => tracing::debug!(
+                        target: WITHHELD_ACCESS_LIST_TARGET,
+                        block = 1u64,
+                        hash = %"0x01",
+                        step = "rejected",
+                        error = %"parallel failed",
+                        "Withheld access list"
                     ),
                     Event::Executed(path, reason) => tracing::debug!(
                         target: BAL_EXECUTION_TARGET,
@@ -493,6 +647,66 @@ mod tests {
         );
     }
 
+    /// The events of a withheld block the two-pass check runs again on its list.
+    const WITHHELD_AND_RERUN: [Event; 6] = [
+        Event::Withheld("import"),
+        Event::Executed("sequential", "no-access-list"),
+        Event::Withheld("collect"),
+        Event::Executed("sequential", "no-access-list"),
+        Event::Withheld("rerun"),
+        Event::Executed("parallel", ""),
+    ];
+
+    /// A withheld block prints one line, with the path of the run that decides it.
+    #[test]
+    fn bal_report_prints_one_line_for_a_withheld_block() {
+        assert_eq!(
+            report_for(&["--bal-report"], &WITHHELD_AND_RERUN),
+            line("parallel", "withheld")
+        );
+        assert_eq!(
+            report_for(
+                &["--bal-report"],
+                &[
+                    Event::Withheld("import"),
+                    Event::Executed("sequential", "no-access-list"),
+                    Event::Withheld("done"),
+                ]
+            ),
+            line("sequential", "withheld")
+        );
+    }
+
+    /// A withheld block the import rejects before executing it prints nothing. Nothing
+    /// is left over from an earlier run of the same block for it to print, and nothing
+    /// of it is left over to change a later run's line.
+    #[test]
+    fn bal_report_prints_nothing_for_a_withheld_block_never_executed() {
+        let mut events = WITHHELD_AND_RERUN.to_vec();
+        events.extend([
+            Event::Withheld("import"),
+            Event::Withheld("done"),
+            Event::Executed("sequential", "no-access-list"),
+        ]);
+        assert_eq!(
+            report_for(&["--bal-report"], &events),
+            line("parallel", "withheld") + &line("sequential", "no-access-list")
+        );
+    }
+
+    /// When the run on the list rejects a block the import accepted, a fallback line
+    /// follows the block's line.
+    #[test]
+    fn bal_report_prints_a_fallback_when_the_runs_disagree() {
+        let mut events = WITHHELD_AND_RERUN.to_vec();
+        events.push(Event::Rejected);
+        assert_eq!(
+            report_for(&["--bal-report"], &events),
+            line("parallel", "withheld")
+                + "{\"event\":\"balFallback\",\"block\":1,\"hash\":\"0x01\",\"parallelError\":\"parallel failed\",\"sequentialResult\":\"valid\",\"sequentialError\":\"\"}\n"
+        );
+    }
+
     /// A fixture and its clean twin share the block hash and may run at once: the
     /// twin, which kept its list, keeps its own line.
     #[test]
@@ -544,14 +758,15 @@ mod tests {
             (&["--no-bal-parallel-exec"][..], false, true),
             (&["--no-precompile-cache"][..], true, false),
         ] {
-            let cli = Cli::try_parse_from([&["runner", "fixtures"], args].concat())
+            let cli = BlocktestCli::try_parse_from([&["runner", "fixtures"], args].concat())
                 .expect("valid arguments");
             let store = Store::new("", EngineType::InMemory).expect("in-memory store");
-            let blockchain = fixture_blockchain(store, &cli.runner.blocktest_options());
+            let blockchain = fixture_blockchain(store, &cli.args.blocktest_options());
             let genesis = serde_json::from_str(GENESIS).expect("genesis parses");
-            let harness = EngineApiHarness::from_genesis(genesis, &cli.runner.enginetest_options())
-                .await
-                .expect("harness builds");
+            let harness =
+                EngineApiHarness::from_genesis(genesis, &cli.args.runner.enginetest_options())
+                    .await
+                    .expect("harness builds");
             for (runner, options) in [
                 ("blocktest", &blockchain.options),
                 ("enginetest", &harness.ctx.blockchain.options),
@@ -566,6 +781,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `--bal-withhold` reaches the options `blocktest` imports with, and
+    /// `enginetest`, which takes the shared options alone, refuses it.
+    #[test]
+    fn bal_withhold_is_a_blocktest_switch() {
+        for (args, withhold) in [(&[][..], false), (&["--bal-withhold"][..], true)] {
+            let cli = BlocktestCli::try_parse_from([&["runner", "fixtures"], args].concat())
+                .expect("valid arguments");
+            assert_eq!(
+                cli.args.blocktest_options().withhold_access_lists,
+                withhold,
+                "{args:?}"
+            );
+        }
+        assert!(Cli::try_parse_from(["runner", "fixtures", "--bal-withhold"]).is_err());
     }
 
     #[test]
