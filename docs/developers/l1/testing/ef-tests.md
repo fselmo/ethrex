@@ -42,3 +42,22 @@ then run the tests:
 ```sh
 make test-levm
 ```
+
+### Standalone runners
+
+`blocktest` and `enginetest` run fixtures from any directory and print one result per fixture, which is how EELS `consume direct` calls them. From `tooling/`:
+
+```sh
+cargo run --profile release-fast -p ef_tests-runners --bin blocktest -- <path>... [--workers N] [--run REGEX] [--json] [--no-bal-parallel-exec] [--no-precompile-cache] [--bal-report]
+cargo run --profile release-fast -p ef_tests-runners --bin enginetest -- <path>... [same flags]
+```
+
+- Each `<path>` is a fixture file or a directory searched recursively for `.json` files; all of them run in one process and print one set of results. `-p/--path <path>` still works and may repeat. A path that does not exist is an error. Both runners exit non-zero when any fixture fails.
+- `blocktest` imports each `blockchain_test` block through the blockchain ef_tests harness, handing it the fixture's `blockAccessList` (or `rlp_decoded.blockAccessList` for a block expected to be invalid) when the keccak of its RLP, in the order given, equals `blockAccessListHash`. A list that does not match or does not parse is dropped, as full sync drops a peer's, and the block runs without it.
+- `enginetest` sends each `blockchain_test_engine` payload and forkchoice update to ethrex's own `engine_newPayloadV<n>` and `engine_forkchoiceUpdatedV<n>` handlers, in process.
+- Each `blocktest` and `enginetest` result lists the blocks or payloads ethrex rejected in `rejections`, `[]` when none: `{"index":0,"hash":"0x…","error":"…"}`, where `index` is the position in `blocks` or `engineNewPayloads` and `error` is ethrex's error as given. A block that does not decode has the decoder's error and no hash; a payload rejected with a JSON-RPC error has `<code>: <message>` (plus `: <data>` when the error has data) and no hash. The runners do not check these errors against the fixture's expected exception: a fixture passes when what it expects to be rejected is rejected, and a harness reading the results can check the reasons with EEST's mapping. (`enginetest`, like the cargo engine harness, still fails a payload rejected for another reason when `ETHREX_ENGINE_STRICT_EXCEPTIONS` is set.)
+- ethrex's `statetest` is `ef_tests-statev2 statetest` (see `tooling/ef_tests/state_v2`).
+- `--version` prints one line naming the client and the tool, `ethrex-blocktest <version>`, `ethrex-enginetest <version>`, or `ethrex-statetest <version>` for `ef_tests-statev2 statetest --version`, where the version is the tooling workspace's; harnesses identify a runner by it.
+- `--no-bal-parallel-exec` (or `ETHREX_NO_BAL_PARALLEL_EXEC`) runs every block on the sequential executor, like the node flag of the same name.
+- `--no-precompile-cache` (or `ETHREX_NO_PRECOMPILE_CACHE`) runs every block without the per-block precompile result cache, like the node flag of the same name.
+- With `--bal-report`, `blocktest` and `enginetest` print the executor chosen for each block as one JSON line on stderr, for example `{"event":"balExecution","block":1,"hash":"0x…","path":"sequential","reason":"disabled"}`. `reason` is `bad-access-list` when the runner dropped the block's delivered list, whatever ran the block. Otherwise it is empty for `parallel`, and for `sequential` the first condition that ruled parallel out: `no-access-list`, `pre-amsterdam`, `disabled` or `no-rayon`. A list over the EIP-7928 item cap shows as `no-access-list`, because the node drops it before the executor. Without the flag these lines are off. stdout carries only the results.
