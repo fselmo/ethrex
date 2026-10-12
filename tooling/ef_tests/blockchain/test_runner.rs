@@ -453,7 +453,7 @@ pub fn hash_as_delivered(bal: &BlockAccessList) -> H256 {
 /// sequentially too.
 fn runs_two_pass(test: &TestUnit, options: &RunOptions) -> bool {
     cfg!(not(feature = "stateless"))
-        && test.network == Fork::Amsterdam
+        && test.network >= Fork::Amsterdam
         && options.bal_parallel_exec
         && (options.withhold_access_lists || !delivers_access_lists(test))
 }
