@@ -243,7 +243,7 @@ pub async fn run_ef_test(
     // already executed every block in parallel on the fixture's own lists. Skipped
     // when parallel execution is off, since pass 2 would run it anyway.
     #[cfg(not(feature = "stateless"))]
-    if test.network == Fork::Amsterdam && options.bal_parallel_exec && !delivers_access_lists(test)
+    if test.network >= Fork::Amsterdam && options.bal_parallel_exec && !delivers_access_lists(test)
     {
         run_two_pass_parallel(test_key, test, options).await?;
     }
