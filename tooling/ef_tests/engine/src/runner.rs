@@ -15,6 +15,9 @@ use crate::harness::{Backend, EngineApiHarness};
 pub struct RunOptions {
     pub backend: Backend,
     pub strict_exceptions: bool,
+    /// Run blocks that carry an access list on the BAL-driven parallel executor,
+    /// as a node does unless started with `--no-bal-parallel-exec`.
+    pub bal_parallel_exec: bool,
 }
 
 impl RunOptions {
@@ -24,6 +27,7 @@ impl RunOptions {
             strict_exceptions: std::env::var("ETHREX_ENGINE_STRICT_EXCEPTIONS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            bal_parallel_exec: true,
         }
     }
 }
@@ -42,6 +46,18 @@ fn parse_backend_env() -> Backend {
             }
         ),
     }
+}
+
+/// A payload the client rejected, with an `INVALID` status or a JSON-RPC error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    /// The payload's position in the fixture's `engineNewPayloads`, from 0.
+    pub index: usize,
+    /// The payload's `blockHash`, for an `INVALID` status.
+    pub hash: Option<H256>,
+    /// The `validationError`, or for a JSON-RPC error `<code>: <message>` and,
+    /// when the error carries data, `: <data>`.
+    pub error: String,
 }
 
 #[derive(Debug)]
@@ -192,10 +208,13 @@ impl fmt::Display for FixtureFailure {
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
+/// Run one fixture, adding each payload the client rejects to `rejections` as it
+/// happens, so they are there even when the fixture then fails.
 pub async fn run_fixture(
     name: &str,
     fix: &EngineFixture,
     opts: &RunOptions,
+    rejections: &mut Vec<Rejection>,
 ) -> Result<(), FixtureFailure> {
     // 1. Pre-Paris skip
     let fork = fix
@@ -209,9 +228,13 @@ pub async fn run_fixture(
     let genesis = fix
         .build_genesis()
         .map_err(|e| FixtureFailure::FixtureParse(e.to_string()))?;
-    let harness = Box::pin(EngineApiHarness::from_genesis(genesis, opts.backend))
-        .await
-        .map_err(|e| FixtureFailure::HarnessSetup(e.to_string()))?;
+    let harness = Box::pin(EngineApiHarness::from_genesis(
+        genesis,
+        opts.backend,
+        opts.bal_parallel_exec,
+    ))
+    .await
+    .map_err(|e| FixtureFailure::HarnessSetup(e.to_string()))?;
 
     let genesis_hash = fix.genesis_block_header.block_hash;
     // 3. Initial FCU to genesis
@@ -230,6 +253,7 @@ pub async fn run_fixture(
         name,
         opts,
         &mut HashMap::new(),
+        rejections,
     ))
     .await
 }
@@ -258,9 +282,13 @@ impl EngineXGroup {
         let genesis = first
             .build_genesis(group)
             .map_err(|e| FixtureFailure::FixtureParse(e.to_string()))?;
-        let harness = Box::pin(EngineApiHarness::from_genesis(genesis, opts.backend))
-            .await
-            .map_err(|e| FixtureFailure::HarnessSetup(e.to_string()))?;
+        let harness = Box::pin(EngineApiHarness::from_genesis(
+            genesis,
+            opts.backend,
+            opts.bal_parallel_exec,
+        ))
+        .await
+        .map_err(|e| FixtureFailure::HarnessSetup(e.to_string()))?;
         Ok(Self {
             harness,
             genesis_hash: group.genesis.block_hash,
@@ -310,6 +338,7 @@ pub async fn run_engine_x_fixture(
         name,
         opts,
         &mut group.first_rejections,
+        &mut Vec::new(),
     ))
     .await
 }
@@ -346,13 +375,15 @@ async fn verify_genesis_block(
 }
 
 /// Per-payload loop (mirrors test_via_engine.py:124–240). `first_rejections`
-/// holds the client's first validation error per block it has rejected.
+/// holds the client's first validation error per block it has rejected; each
+/// payload the client rejects is added to `rejections` as it happens.
 async fn replay_payloads(
     harness: &EngineApiHarness,
     payloads: &[FixturePayload],
     name: &str,
     opts: &RunOptions,
     first_rejections: &mut HashMap<H256, String>,
+    rejections: &mut Vec<Rejection>,
 ) -> Result<(), FixtureFailure> {
     for (i, payload) in payloads.iter().enumerate() {
         // zkevm fixtures carry an expected witness per payload: route those
@@ -373,7 +404,22 @@ async fn replay_payloads(
             index: i,
             msg: e.to_string(),
         })?;
-        let first_rejection = match (rejection_error(&resp), payload.head_block_hash().ok()) {
+        if let Some(error) = rejection_error(&resp) {
+            let hash = if resp.get("error").is_some() {
+                None
+            } else {
+                payload.head_block_hash().ok()
+            };
+            rejections.push(Rejection {
+                index: i,
+                hash,
+                error,
+            });
+        }
+        let first_rejection = match (
+            invalid_validation_error(&resp),
+            payload.head_block_hash().ok(),
+        ) {
             (Some(error), Some(block_hash)) => Some(
                 first_rejections
                     .entry(block_hash)
@@ -545,12 +591,36 @@ fn witness_diff_detail(section: &str, got: &[Vec<u8>], exp: &[Vec<u8>]) -> Strin
 }
 
 /// The `validationError` of an `INVALID` newPayload response, if any.
-fn rejection_error(resp: &Value) -> Option<&str> {
+fn invalid_validation_error(resp: &Value) -> Option<&str> {
     let result = resp.get("result")?;
     if result.get("status").and_then(Value::as_str) != Some("INVALID") {
         return None;
     }
     result.get("validationError").and_then(Value::as_str)
+}
+
+/// The client's error for a `newPayload` response that rejects the payload: its
+/// `validationError` for an `INVALID` status, or the JSON-RPC error as
+/// `<code>: <message>`, plus `: <data>` when the error carries data (a string as
+/// is, anything else as compact JSON).
+fn rejection_error(resp: &Value) -> Option<String> {
+    if let Some(err) = resp.get("error") {
+        let code = err.get("code").map(Value::to_string).unwrap_or_default();
+        let message = err.get("message").and_then(Value::as_str).unwrap_or("");
+        let mut error = format!("{code}: {message}");
+        match err.get("data") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(data)) => error.push_str(&format!(": {data}")),
+            Some(data) => error.push_str(&format!(": {data}")),
+        }
+        return Some(error);
+    }
+    let result = resp.get("result")?;
+    if result.get("status").and_then(Value::as_str) != Some("INVALID") {
+        return None;
+    }
+    let validation_error = result.get("validationError").and_then(Value::as_str);
+    Some(validation_error.unwrap_or_default().to_string())
 }
 
 /// `first_rejection` is the client's first validation error for this payload's
@@ -717,7 +787,35 @@ mod tests {
         RunOptions {
             backend: Backend::InMemory,
             strict_exceptions: false,
+            bal_parallel_exec: true,
         }
+    }
+
+    #[test]
+    fn rejection_error_is_the_clients_error() {
+        let error = |resp: Value| rejection_error(&resp);
+        assert_eq!(
+            error(serde_json::json!({"result": {"status": "INVALID", "validationError": "bad"}})),
+            Some("bad".to_string())
+        );
+        assert_eq!(
+            error(serde_json::json!({"result": {"status": "VALID", "validationError": null}})),
+            None
+        );
+        assert_eq!(
+            error(serde_json::json!({"error": {"code": -38005, "message": "Unsupported fork"}})),
+            Some("-38005: Unsupported fork".to_string())
+        );
+        assert_eq!(
+            error(serde_json::json!({"error": {"code": -32602, "message": "m", "data": "d"}})),
+            Some("-32602: m: d".to_string())
+        );
+        assert_eq!(
+            error(
+                serde_json::json!({"error": {"code": -32602, "message": "m", "data": {"err": "e"}}})
+            ),
+            Some(r#"-32602: m: {"err":"e"}"#.to_string())
+        );
     }
 
     /// Pre-Paris fixtures must return SkippedPreParis (is_skip() == true).
@@ -751,7 +849,7 @@ mod tests {
         let fixtures: EngineFixtureFile = serde_json::from_str(&raw).unwrap();
         let opts = inmem_opts();
         let (name, fixture) = fixtures.iter().next().unwrap();
-        let err = run_fixture(name, fixture, &opts)
+        let err = run_fixture(name, fixture, &opts, &mut Vec::new())
             .await
             .expect_err("London fixture must be skipped");
         assert!(err.is_skip(), "expected SkippedPreParis, got: {err}");

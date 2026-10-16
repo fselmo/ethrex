@@ -10,4 +10,6 @@ pub use fixture::{
 };
 pub use harness::{Backend, EngineApiHarness};
 pub use report::{render_failures, render_summary};
-pub use runner::{EngineXGroup, FixtureFailure, RunOptions, run_engine_x_fixture, run_fixture};
+pub use runner::{
+    EngineXGroup, FixtureFailure, Rejection, RunOptions, run_engine_x_fixture, run_fixture,
+};
