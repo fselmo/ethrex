@@ -18,6 +18,20 @@ pub struct RunOptions {
     /// Run blocks that carry an access list on the BAL-driven parallel executor,
     /// as a node does unless started with `--no-bal-parallel-exec`.
     pub bal_parallel_exec: bool,
+    /// Cache precompile results within a block, as a node does unless started with
+    /// `--no-precompile-cache`.
+    pub precompile_cache: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            backend: Backend::InMemory,
+            strict_exceptions: false,
+            bal_parallel_exec: true,
+            precompile_cache: true,
+        }
+    }
 }
 
 impl RunOptions {
@@ -27,7 +41,7 @@ impl RunOptions {
             strict_exceptions: std::env::var("ETHREX_ENGINE_STRICT_EXCEPTIONS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            bal_parallel_exec: true,
+            ..Self::default()
         }
     }
 }
@@ -228,13 +242,9 @@ pub async fn run_fixture(
     let genesis = fix
         .build_genesis()
         .map_err(|e| FixtureFailure::FixtureParse(e.to_string()))?;
-    let harness = Box::pin(EngineApiHarness::from_genesis(
-        genesis,
-        opts.backend,
-        opts.bal_parallel_exec,
-    ))
-    .await
-    .map_err(|e| FixtureFailure::HarnessSetup(e.to_string()))?;
+    let harness = Box::pin(EngineApiHarness::from_genesis(genesis, opts))
+        .await
+        .map_err(|e| FixtureFailure::HarnessSetup(e.to_string()))?;
 
     let genesis_hash = fix.genesis_block_header.block_hash;
     // 3. Initial FCU to genesis
@@ -282,13 +292,9 @@ impl EngineXGroup {
         let genesis = first
             .build_genesis(group)
             .map_err(|e| FixtureFailure::FixtureParse(e.to_string()))?;
-        let harness = Box::pin(EngineApiHarness::from_genesis(
-            genesis,
-            opts.backend,
-            opts.bal_parallel_exec,
-        ))
-        .await
-        .map_err(|e| FixtureFailure::HarnessSetup(e.to_string()))?;
+        let harness = Box::pin(EngineApiHarness::from_genesis(genesis, opts))
+            .await
+            .map_err(|e| FixtureFailure::HarnessSetup(e.to_string()))?;
         Ok(Self {
             harness,
             genesis_hash: group.genesis.block_hash,
@@ -788,6 +794,7 @@ mod tests {
             backend: Backend::InMemory,
             strict_exceptions: false,
             bal_parallel_exec: true,
+            precompile_cache: true,
         }
     }
 
