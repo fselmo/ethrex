@@ -45,6 +45,72 @@ fn merkle_pool() -> Arc<rayon::ThreadPool> {
     MERKLE_POOL.with(|cell| cell.get_or_init(Blockchain::build_merkle_pool).clone())
 }
 
+/// Tests skipped by every run: they take too long, or ethrex cannot represent them.
+pub const SKIPPED_TESTS: &[&str] = &[
+    // Skip because they take too long to run, but they pass
+    "static_Call50000_sha256",
+    "CALLBlake2f_MaxRounds",
+    "loopMul",
+    // Skip because it tries to deserialize number > U256::MAX
+    "ValueOverflowParis",
+    // Skip because it's a "Create" Blob Transaction, which doesn't actually exist. It never reaches the EVM because we can't even parse it as an actual Transaction.
+    "createBlobhashTx",
+];
+
+/// How a fixture's blocks are executed.
+#[derive(Debug, Clone, Copy)]
+pub struct RunOptions {
+    /// Run blocks that carry an access list on the BAL-driven parallel executor,
+    /// as a node does unless started with `--no-bal-parallel-exec`.
+    pub bal_parallel_exec: bool,
+    /// Import every block without the access list its fixture delivers, so the client
+    /// executes it without one and checks the list it builds against the header.
+    pub withhold_access_lists: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            bal_parallel_exec: true,
+            withhold_access_lists: false,
+        }
+    }
+}
+
+/// A block the client rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    /// The block's position in the fixture's `blocks`, from 0.
+    pub index: usize,
+    /// The block's hash, unless the block did not decode.
+    pub hash: Option<H256>,
+    /// The client's error, as it reports it.
+    pub error: String,
+}
+
+/// Why a fixture is not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Its name contains an entry of the skip list.
+    Named,
+    /// Its fork is before the Merge, which ethrex does not execute.
+    PreMerge,
+}
+
+pub fn skip_reason(
+    test_key: &str,
+    test: &TestUnit,
+    skipped_tests: Option<&[&str]>,
+) -> Option<SkipReason> {
+    if skipped_tests.is_some_and(|skipped| skipped.iter().any(|s| test_key.contains(s))) {
+        return Some(SkipReason::Named);
+    }
+    if test.network < Fork::Merge {
+        return Some(SkipReason::PreMerge);
+    }
+    None
+}
+
 pub fn parse_and_execute(
     path: &Path,
     skipped_tests: Option<&[&str]>,
@@ -59,19 +125,23 @@ pub fn parse_and_execute(
     let parsed = tests.len();
 
     for (test_key, test) in tests {
-        let named = skipped_tests
-            .map(|skipped| skipped.iter().any(|s| test_key.contains(s)))
-            .unwrap_or(false);
-        if named {
-            skipped_by_name += 1;
-            continue;
-        }
-        if test.network < Fork::Merge {
-            continue;
+        match skip_reason(&test_key, &test, skipped_tests) {
+            Some(SkipReason::Named) => {
+                skipped_by_name += 1;
+                continue;
+            }
+            Some(SkipReason::PreMerge) => continue,
+            None => {}
         }
         executed += 1;
 
-        let result = rt.block_on(run_ef_test(&test_key, &test, run_stateless));
+        let result = rt.block_on(run_ef_test(
+            &test_key,
+            &test,
+            run_stateless,
+            &RunOptions::default(),
+            &mut Vec::new(),
+        ));
 
         if let Err(e) = result {
             eprintln!("Test {test_key} failed: {e:?}");
@@ -102,10 +172,14 @@ pub fn parse_and_execute(
     }
 }
 
+/// Run one fixture, adding each block the client rejects to `rejections` as it
+/// happens, so they are there even when the fixture then fails or panics.
 pub async fn run_ef_test(
     test_key: &str,
     test: &TestUnit,
     run_stateless: bool,
+    options: &RunOptions,
+    rejections: &mut Vec<Rejection>,
 ) -> Result<(), String> {
     // check that the decoded genesis block header matches the deserialized one
     let genesis_rlp = test.genesis_rlp.clone();
@@ -124,16 +198,27 @@ pub async fn run_ef_test(
     check_prestate_against_db(test_key, test, &store);
 
     // Blockchain EF tests are meant for L1.
-    let blockchain = Blockchain::for_test_harness_with_pool(store.clone(), merkle_pool());
+    let mut blockchain = Blockchain::for_test_harness_with_pool(store.clone(), merkle_pool());
+    blockchain.options.bal_parallel_exec_enabled = options.bal_parallel_exec;
 
     // Early return if the exception is in the rlp decoding of the block
-    for bf in &test.blocks {
-        if bf.expect_exception.is_some() && exception_in_rlp_decoding(bf) {
+    for (index, bf) in test.blocks.iter().enumerate() {
+        if bf.expect_exception.is_none() {
+            continue;
+        }
+        if let Err(error) = CoreBlock::decode(bf.rlp.as_ref()) {
+            rejections.push(Rejection {
+                index,
+                hash: None,
+                error: error.to_string(),
+            });
+        }
+        if exception_in_rlp_decoding(bf) {
             return Ok(());
         }
     }
 
-    run(test_key, test, &blockchain, &store).await?;
+    run(test_key, test, &blockchain, &store, options, rejections).await?;
 
     // For Amsterdam tests, exercise the parallel BAL execution path as a correctness check.
     // Two-pass approach: pass 1 collects the BAL produced by sequential execution, pass 2
@@ -143,8 +228,12 @@ pub async fn run_ef_test(
     // and doesn't drive `add_block_pipeline`, and BAL-warmed parallel execution gives no
     // benefit in single-threaded zkVM guest builds. The non-stateless runs are the right
     // home for this check.
+    // Only needed when the fixture delivers no access lists: otherwise `run` has
+    // already executed every block in parallel on the fixture's own lists. Skipped
+    // when parallel execution is off, since pass 2 would run it anyway.
     #[cfg(not(feature = "stateless"))]
-    if test.network == Fork::Amsterdam {
+    if test.network == Fork::Amsterdam && options.bal_parallel_exec && !delivers_access_lists(test)
+    {
         run_two_pass_parallel(test_key, test).await?;
     }
 
@@ -182,21 +271,32 @@ async fn run(
     test: &TestUnit,
     blockchain: &Blockchain,
     store: &Store,
+    options: &RunOptions,
+    rejections: &mut Vec<Rejection>,
 ) -> Result<(), String> {
     // Execute all blocks in test
-    for block_fixture in test.blocks.iter() {
+    for (index, block_fixture) in test.blocks.iter().enumerate() {
         let expects_exception = block_fixture.expect_exception.is_some();
 
         // Won't panic because test has been validated
         let block: CoreBlock = block_fixture.block().unwrap().clone().into();
         let hash = block.hash();
-        let bal = delivered_access_list(block_fixture.block_access_list(), &block);
+        let bal = if options.withhold_access_lists {
+            None
+        } else {
+            delivered_access_list(block_fixture.block_access_list(), &block)
+        };
 
         // Attempt to add the block as the head of the chain
         let chain_result = blockchain.add_block_pipeline(block.clone(), bal);
 
         match chain_result {
             Err(error) => {
+                rejections.push(Rejection {
+                    index,
+                    hash: Some(hash),
+                    error: error.to_string(),
+                });
                 if !expects_exception {
                     return Err(format!(
                         "Transaction execution unexpectedly failed on test: {test_key}, with error {error:?}",
@@ -295,6 +395,15 @@ pub fn hash_as_delivered(bal: &BlockAccessList) -> H256 {
     }
     let accounts: Vec<Account> = bal.accounts().iter().map(Account).collect();
     keccak(accounts.encode_to_vec())
+}
+
+/// Whether any block of the fixture carries its access list.
+#[cfg(not(feature = "stateless"))]
+fn delivers_access_lists(test: &TestUnit) -> bool {
+    test.blocks.iter().any(|b| {
+        b.block()
+            .is_some_and(|block| block.block_access_list_data.is_some())
+    })
 }
 
 /// Two-pass parallel execution check for Amsterdam tests.
