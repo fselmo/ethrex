@@ -48,12 +48,17 @@ fn main() -> ExitCode {
         precompile_cache: !cli.runner.no_precompile_cache,
     };
     let results = run_files(&files, cli.runner.workers, |file| {
-        run_file(file, &options, &rt)
+        run_file(file, &cli.runner, &options, &rt)
     });
     report(&results, cli.runner.json, started)
 }
 
-fn run_file(file: &Path, options: &RunOptions, rt: &tokio::runtime::Runtime) -> Vec<FixtureResult> {
+fn run_file(
+    file: &Path,
+    args: &RunnerArgs,
+    options: &RunOptions,
+    rt: &tokio::runtime::Runtime,
+) -> Vec<FixtureResult> {
     let tests: HashMap<String, TestUnit> = match std::fs::read_to_string(file)
         .map_err(|e| e.to_string())
         .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
@@ -65,7 +70,9 @@ fn run_file(file: &Path, options: &RunOptions, rt: &tokio::runtime::Runtime) -> 
     tests.sort_by(|a, b| a.0.cmp(&b.0));
     tests
         .into_iter()
-        .filter(|(name, test)| skip_reason(name, test, Some(SKIPPED_TESTS)).is_none())
+        .filter(|(name, test)| {
+            args.selects(name) && skip_reason(name, test, Some(SKIPPED_TESTS)).is_none()
+        })
         .map(|(name, test)| {
             let mut rejections = Vec::new();
             let outcome = catch_unwind(AssertUnwindSafe(|| {
