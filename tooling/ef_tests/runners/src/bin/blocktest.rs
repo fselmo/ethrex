@@ -37,8 +37,10 @@ fn main() -> ExitCode {
     let rt = tokio::runtime::Runtime::new().expect("failed to build the tokio runtime");
     let files = match collect_json_files(cli.runner.fixture_paths()) {
         Ok(files) => files,
-        Err(e) => {
-            eprintln!("error: {e}");
+        Err(errors) => {
+            for e in errors {
+                eprintln!("error: {e}");
+            }
             return runner_error();
         }
     };
@@ -48,10 +50,10 @@ fn main() -> ExitCode {
         precompile_cache: !cli.runner.no_precompile_cache,
         check_exception_names: false,
     };
-    let results = run_files(&files, cli.runner.workers, |file| {
+    let outcome = run_files(&files, cli.runner.workers, |file| {
         run_file(file, &cli.runner, &options, &rt)
     });
-    report(&results, cli.runner.json, started)
+    report(&outcome, cli.runner.json, started)
 }
 
 fn run_file(
@@ -59,17 +61,13 @@ fn run_file(
     args: &RunnerArgs,
     options: &RunOptions,
     rt: &tokio::runtime::Runtime,
-) -> Vec<FixtureResult> {
-    let tests: HashMap<String, TestUnit> = match std::fs::read_to_string(file)
+) -> Result<Vec<FixtureResult>, String> {
+    let tests: HashMap<String, TestUnit> = std::fs::read_to_string(file)
         .map_err(|e| e.to_string())
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
-    {
-        Ok(tests) => tests,
-        Err(e) => return vec![FixtureResult::unreadable(file, e)],
-    };
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))?;
     let mut tests: Vec<_> = tests.into_iter().collect();
     tests.sort_by(|a, b| a.0.cmp(&b.0));
-    tests
+    Ok(tests
         .into_iter()
         .filter(|(name, test)| {
             args.selects(name) && skip_reason(name, test, Some(SKIPPED_TESTS)).is_none()
@@ -82,5 +80,5 @@ fn run_file(
             let rejections = rejections.into_iter().map(Into::into).collect();
             FixtureResult::from_outcome(name, format!("{:?}", test.network), outcome, rejections)
         })
-        .collect()
+        .collect())
 }

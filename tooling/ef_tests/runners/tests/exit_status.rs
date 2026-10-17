@@ -70,8 +70,9 @@ fn exits_2_on_a_file_that_does_not_parse(bin: &str, name: &str, test: &str) {
     let unparseable = scratch(test).join("unparseable.json");
     std::fs::write(&unparseable, "not json").unwrap();
     let output = run(bin, &[&fixture(name), &unparseable]);
-    // The other file still runs and is reported.
-    assert_eq!(verdicts(&output), [false, true]);
+    // The other file still runs and is reported; the unparseable one is only on
+    // stderr.
+    assert_eq!(verdicts(&output), [true]);
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
