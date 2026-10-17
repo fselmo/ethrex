@@ -317,6 +317,16 @@ async fn run(
         let block: CoreBlock = block_fixture.block().unwrap().clone().into();
         let hash = block.hash();
         let bal = if options.withhold_access_lists {
+            if block_fixture
+                .block()
+                .is_some_and(|block| block.block_access_list_data.is_some())
+            {
+                tracing::debug!(
+                    target: WITHHELD_ACCESS_LIST_TARGET,
+                    hash = %format_args!("{hash:#x}"),
+                    "Withholding the delivered access list"
+                );
+            }
             None
         } else {
             delivered_access_list(block_fixture.block_access_list(), &block)
@@ -375,6 +385,11 @@ async fn run(
 /// Tracing target of the event the runner emits when it drops a delivered access
 /// list, so a report can tell a dropped list from none.
 pub const DROPPED_ACCESS_LIST_TARGET: &str = "ef_tests::dropped_access_list";
+
+/// Tracing target of the event the runner emits when it withholds a block's list
+/// (`RunOptions::withhold_access_lists`), so a report can tell a withheld list from
+/// a block that has none.
+pub const WITHHELD_ACCESS_LIST_TARGET: &str = "ef_tests::withheld_access_list";
 
 /// The access list the fixture delivers with `block`, if the header commits to it.
 ///
