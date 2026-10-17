@@ -11,6 +11,12 @@ use crate::harness::{Backend, EngineApiHarness};
 #[derive(Debug)]
 pub struct RunOptions {
     pub backend: Backend,
+    /// Check an `INVALID` payload's `validationError` against the fixture's, as
+    /// the cargo engine harness does: a mismatch is warned about, or fails the
+    /// fixture with `strict_exceptions`. Without it a fixture's verdict depends
+    /// only on which payloads it expects to be rejected (and the JSON-RPC error
+    /// code it expects).
+    pub check_exception_names: bool,
     pub strict_exceptions: bool,
     /// Run blocks that carry an access list on the BAL-driven parallel executor,
     /// as a node does unless started with `--no-bal-parallel-exec`.
@@ -24,6 +30,7 @@ impl Default for RunOptions {
     fn default() -> Self {
         Self {
             backend: Backend::InMemory,
+            check_exception_names: true,
             strict_exceptions: false,
             bal_parallel_exec: true,
             precompile_cache: true,
@@ -300,7 +307,7 @@ pub async fn run_fixture(
                 error,
             });
         }
-        check_payload_response(&resp, payload, i, opts.strict_exceptions, name)?;
+        check_payload_response(&resp, payload, i, opts, name)?;
         if with_witness && payload.valid() {
             check_witness_response(&resp, payload, i, name)?;
         }
@@ -483,7 +490,7 @@ fn check_payload_response(
     resp: &Value,
     payload: &FixturePayload,
     index: usize,
-    strict: bool,
+    opts: &RunOptions,
     name: &str,
 ) -> Result<(), FixtureFailure> {
     // JSON-RPC error path
@@ -550,7 +557,7 @@ fn check_payload_response(
     }
 
     // INVALID payloads: check validationError only when the fixture expects one
-    if status == "INVALID" {
+    if status == "INVALID" && opts.check_exception_names {
         let got_ve = result
             .get("validationError")
             .and_then(|v| v.as_str())
@@ -574,9 +581,9 @@ fn check_payload_response(
                         index,
                         expected: candidates.iter().map(|s| s.to_string()).collect(),
                         got,
-                        strict,
+                        strict: opts.strict_exceptions,
                     };
-                    if strict {
+                    if opts.strict_exceptions {
                         return Err(f);
                     } else {
                         eprintln!("warn [{name}]: {f}");
@@ -632,6 +639,7 @@ mod tests {
     fn inmem_opts() -> RunOptions {
         RunOptions {
             backend: Backend::InMemory,
+            check_exception_names: true,
             strict_exceptions: false,
             bal_parallel_exec: true,
             precompile_cache: true,
