@@ -6,6 +6,7 @@
 //! `test_bal_post_execution_calls_net_storage_at_last_index` (valid, with its
 //! access list) and `test_bal_invalid_missing_system_contract_entry`
 //! (`history_storage`), whose header commits to a list execution does not match.
+//! `blocktest_rejections.json`'s `clean` gives a Paris block, which has no list.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,6 +15,8 @@ use serde_json::{Map, Value};
 
 const VALID_BLOCK: &str = "0x52f2953e505ce739d7c992a9d2f9d89f5f34b5a97f3a7e77dfe6484e3e687e41";
 const MISMATCHED_BLOCK: &str = "0xff1a7dc74576788b6c2e5b039a0a623b943c4cea817c15276c223daee6578d80";
+/// The one block of `clean` in `blocktest_rejections.json`, a Paris fixture.
+const PARIS_BLOCK: &str = "0x38e257fab98caf7f165cdec38a5547940e3709cf6d55e95acac0283d7a0d1985";
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -111,6 +114,25 @@ fn blocktest_reports_a_withheld_list() {
             expected(VALID_BLOCK, "sequential", "withheld")
         );
     }
+}
+
+/// A block without a list (before Amsterdam) has nothing to withhold, so its line
+/// keeps ethrex's own reason under `--bal-withhold`.
+#[test]
+fn blocktest_withhold_keeps_the_reason_of_a_block_without_a_list() {
+    let fixtures: Map<String, Value> = serde_json::from_str(
+        &std::fs::read_to_string(fixture("blocktest_rejections.json")).unwrap(),
+    )
+    .unwrap();
+    let clean = Map::from_iter([("clean".to_string(), fixtures["clean"].clone())]);
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("bal_report_no_list.json");
+    std::fs::write(&path, Value::Object(clean).to_string()).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_blocktest");
+    assert_eq!(
+        bal_report(bin, &path, &["--bal-withhold"]),
+        expected(PARIS_BLOCK, "sequential", "no-access-list")
+    );
 }
 
 #[test]
