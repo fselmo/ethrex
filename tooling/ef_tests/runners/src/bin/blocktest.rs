@@ -46,6 +46,7 @@ fn main() -> ExitCode {
         bal_parallel_exec: !cli.runner.bal_sequential,
         withhold_access_lists: cli.bal_withhold,
         precompile_cache: !cli.runner.no_precompile_cache,
+        check_exception_names: false,
     };
     let results = run_files(&files, cli.runner.workers, |file| {
         run_file(file, &cli.runner, &options, &rt)
