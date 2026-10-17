@@ -54,6 +54,7 @@ fn run_file(file: &Path, args: &RunnerArgs, rt: &tokio::runtime::Runtime) -> Vec
     let opts = RunOptions {
         bal_parallel_exec: !args.bal_sequential,
         precompile_cache: !args.no_precompile_cache,
+        check_exception_names: false,
         ..RunOptions::from_env()
     };
     let mut results = Vec::new();

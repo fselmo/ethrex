@@ -7,18 +7,33 @@
 //! payload's `blockHash` and expects the resulting error code.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
 
 /// The results for `fixture`, by fixture name.
-fn results(bin: &str, fixture: &str) -> HashMap<String, Value> {
-    let path = format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
-    let output = Command::new(bin)
-        .args(["--json", &path])
-        .env_remove("ETHREX_ENGINE_STRICT_EXCEPTIONS")
-        .output()
-        .expect("failed to run the binary");
+fn results(bin: &str, fixture_name: &str) -> HashMap<String, Value> {
+    results_at(bin, &fixture(fixture_name), false)
+}
+
+/// The results for the fixture file at `path`, by fixture name, with
+/// `ETHREX_ENGINE_STRICT_EXCEPTIONS` set when `strict`.
+fn results_at(bin: &str, path: &Path, strict: bool) -> HashMap<String, Value> {
+    let mut command = Command::new(bin);
+    command.arg("--json").arg(path);
+    if strict {
+        command.env("ETHREX_ENGINE_STRICT_EXCEPTIONS", "1");
+    } else {
+        command.env_remove("ETHREX_ENGINE_STRICT_EXCEPTIONS");
+    }
+    let output = command.output().expect("failed to run the binary");
     let results: Vec<Value> =
         serde_json::from_slice(&output.stdout).expect("stdout is one JSON array");
     results
@@ -132,4 +147,69 @@ fn enginetest_does_not_check_the_rejection_reason() {
     let rejections = rejections_in(wrong, true);
     assert_eq!(rejections.len(), 1, "{wrong}");
     assert!(rejections[0].1.contains(BASE_FEE_ERROR), "{wrong}");
+}
+
+/// A copy of the fixture file `name` in which every block or payload that expects
+/// to be rejected names `exception` instead.
+fn renamed_copy(name: &str, exception: &str) -> PathBuf {
+    let mut fixtures: Map<String, Value> =
+        serde_json::from_slice(&std::fs::read(fixture(name)).unwrap()).unwrap();
+    for fixture in fixtures.values_mut() {
+        for (list, field) in [
+            ("blocks", "expectException"),
+            ("engineNewPayloads", "validationError"),
+        ] {
+            for entry in fixture[list].as_array_mut().into_iter().flatten() {
+                if entry.get(field).is_some_and(|v| !v.is_null()) {
+                    entry[field] = exception.into();
+                }
+            }
+        }
+    }
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("renamed-{exception}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, serde_json::to_vec(&fixtures).unwrap()).unwrap();
+    path
+}
+
+/// The verdict and rejections of each fixture, which renaming the exceptions the
+/// fixtures expect must leave alone.
+fn outcomes(results: &HashMap<String, Value>) -> HashMap<String, (Value, Value)> {
+    results
+        .iter()
+        .map(|(name, r)| (name.clone(), (r["pass"].clone(), r["rejections"].clone())))
+        .collect()
+}
+
+#[test]
+fn blocktest_verdicts_do_not_depend_on_the_exception_named() {
+    let bin = env!("CARGO_BIN_EXE_blocktest");
+    let original = results(bin, "blocktest_rejections.json");
+    // Includes the block that does not decode, now expecting an execution error.
+    let renamed = results_at(
+        bin,
+        &renamed_copy(
+            "blocktest_rejections.json",
+            "BlockException.INCORRECT_BLOB_GAS_USED",
+        ),
+        false,
+    );
+    assert_eq!(outcomes(&renamed), outcomes(&original));
+    assert_passes(&renamed["undecodable"]);
+}
+
+#[test]
+fn enginetest_verdicts_do_not_depend_on_the_exception_named() {
+    let bin = env!("CARGO_BIN_EXE_enginetest");
+    let original = results(bin, "enginetest_rejections.json");
+    let renamed_file = renamed_copy(
+        "enginetest_rejections.json",
+        "BlockException.INCORRECT_BLOB_GAS_USED",
+    );
+    // `ETHREX_ENGINE_STRICT_EXCEPTIONS` is for the cargo engine harness only.
+    for strict in [false, true] {
+        let renamed = results_at(bin, &renamed_file, strict);
+        assert_eq!(outcomes(&renamed), outcomes(&original), "strict={strict}");
+    }
 }

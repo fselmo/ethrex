@@ -69,6 +69,12 @@ pub struct RunOptions {
     /// Cache precompile results within a block, as a node does unless started with
     /// `--no-precompile-cache`.
     pub precompile_cache: bool,
+    /// Check ethrex's errors against the fixture's expected exceptions, as the
+    /// ef_tests suite does: a block that fails to decode must expect a decoding
+    /// exception, and an import error other than the expected one is warned about.
+    /// Without it a fixture's verdict depends only on which blocks it expects to be
+    /// rejected.
+    pub check_exception_names: bool,
 }
 
 impl Default for RunOptions {
@@ -77,6 +83,7 @@ impl Default for RunOptions {
             bal_parallel_exec: true,
             withhold_access_lists: false,
             precompile_cache: true,
+            check_exception_names: true,
         }
     }
 }
@@ -213,19 +220,21 @@ pub async fn run_ef_test(
     let blockchain = fixture_blockchain(store.clone(), options);
 
     // Early return if the exception is in the rlp decoding of the block
-    for (index, bf) in test.blocks.iter().enumerate() {
-        if bf.expect_exception.is_none() {
-            continue;
-        }
-        if let Err(error) = CoreBlock::decode(bf.rlp.as_ref()) {
-            rejections.push(Rejection {
-                index,
-                hash: None,
-                error: error.to_string(),
-            });
-        }
-        if exception_in_rlp_decoding(bf) {
-            return Ok(());
+    if options.check_exception_names {
+        for (index, bf) in test.blocks.iter().enumerate() {
+            if bf.expect_exception.is_none() {
+                continue;
+            }
+            if let Err(error) = CoreBlock::decode(bf.rlp.as_ref()) {
+                rejections.push(Rejection {
+                    index,
+                    hash: None,
+                    error: error.to_string(),
+                });
+            }
+            if exception_in_rlp_decoding(bf) {
+                return Ok(());
+            }
         }
     }
 
@@ -289,6 +298,21 @@ async fn run(
     for (index, block_fixture) in test.blocks.iter().enumerate() {
         let expects_exception = block_fixture.expect_exception.is_some();
 
+        // A block that does not decode is rejected before import, and has no hash.
+        if let Err(error) = CoreBlock::decode(block_fixture.rlp.as_ref()) {
+            rejections.push(Rejection {
+                index,
+                hash: None,
+                error: error.to_string(),
+            });
+            if !expects_exception {
+                return Err(format!(
+                    "Block {index} unexpectedly failed to decode on test: {test_key}, with error {error:?}",
+                ));
+            }
+            continue;
+        }
+
         // Won't panic because test has been validated
         let block: CoreBlock = block_fixture.block().unwrap().clone().into();
         let hash = block.hash();
@@ -314,7 +338,9 @@ async fn run(
                     ));
                 }
                 let expected_exception = block_fixture.expect_exception.clone().unwrap();
-                if !exception_is_expected(expected_exception.clone(), &error) {
+                if options.check_exception_names
+                    && !exception_is_expected(expected_exception.clone(), &error)
+                {
                     eprintln!(
                         "Warning: Returned exception {error:?} does not match expected {expected_exception:?}",
                     );
