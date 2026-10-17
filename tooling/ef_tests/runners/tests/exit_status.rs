@@ -21,22 +21,13 @@ fn scratch(test: &str) -> PathBuf {
     dir
 }
 
-/// A copy of the fixture file `name` whose fixtures all fail: a block test
-/// expects a last block hash the chain never has, and an engine test expects its
-/// valid payloads to be rejected. (A wrong genesis hash would make the engine
-/// test's first forkchoice update start a sync, which can exit the process.)
+/// A copy of the fixture file `name` whose fixtures all fail: each expects a last
+/// block hash the chain never has.
 fn failing_copy(name: &str, test: &str) -> PathBuf {
     let mut fixtures: Map<String, Value> =
         serde_json::from_slice(&std::fs::read(fixture(name)).unwrap()).unwrap();
     for fixture in fixtures.values_mut() {
-        match fixture.get_mut("engineNewPayloads") {
-            Some(Value::Array(payloads)) => {
-                for payload in payloads {
-                    payload["validationError"] = "BlockException.INVALID_STATE_ROOT".into();
-                }
-            }
-            _ => fixture["lastblockhash"] = format!("0x{}", "11".repeat(32)).into(),
-        }
+        fixture["lastblockhash"] = format!("0x{}", "11".repeat(32)).into();
     }
     let path = scratch(test).join(name);
     std::fs::write(&path, serde_json::to_vec(&fixtures).unwrap()).unwrap();

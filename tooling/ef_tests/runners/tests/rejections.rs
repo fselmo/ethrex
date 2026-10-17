@@ -4,7 +4,8 @@
 //! The fixtures are tests@v21.0.0 fixtures, some edited: `rejected_twice`
 //! repeats its invalid block, `rejected_for_another_reason` names an exception
 //! other than the one the block is rejected for, and `json_rpc_error` drops the
-//! payload's `blockHash` and expects the resulting error code.
+//! payload's `blockHash` and expects the resulting error code, with the genesis
+//! as its last block.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
