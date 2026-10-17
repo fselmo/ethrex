@@ -140,6 +140,11 @@ pub enum FixtureFailure {
         index: usize,
         msg: String,
     },
+    HeadRpc(String),
+    LastBlockHashMismatch {
+        expected: H256,
+        got: H256,
+    },
 }
 
 impl FixtureFailure {
@@ -219,6 +224,13 @@ impl fmt::Display for FixtureFailure {
             }
             FixtureFailure::FollowupFcu { index, msg } => {
                 write!(f, "followup_fcu[{index}]  error={msg}")
+            }
+            FixtureFailure::HeadRpc(e) => write!(f, "head_rpc  error={e}"),
+            FixtureFailure::LastBlockHashMismatch { expected, got } => {
+                write!(
+                    f,
+                    "lastblockhash_mismatch  expected={expected:#x}  got={got:#x}"
+                )
             }
         }
     }
@@ -327,6 +339,18 @@ pub async fn run_fixture(
             assert_fcu_valid(&fcu_resp)
                 .map_err(|e| FixtureFailure::FollowupFcu { index: i, msg: e })?;
         }
+    }
+
+    // 6. The head the payloads and forkchoice updates left must be `lastblockhash`.
+    let block = Box::pin(harness.get_latest_block())
+        .await
+        .map_err(|e| FixtureFailure::HeadRpc(e.to_string()))?;
+    let head = parse_block_hash(&block).map_err(FixtureFailure::HeadRpc)?;
+    if head != fix.lastblockhash {
+        return Err(FixtureFailure::LastBlockHashMismatch {
+            expected: fix.lastblockhash,
+            got: head,
+        });
     }
 
     Ok(())

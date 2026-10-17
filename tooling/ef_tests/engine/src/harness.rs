@@ -165,6 +165,15 @@ impl EngineApiHarness {
         )
         .await
     }
+
+    /// Call `eth_getBlockByNumber("latest", false)` and return the raw JSON response.
+    pub async fn get_latest_block(&self) -> anyhow::Result<Value> {
+        self.call(
+            "eth_getBlockByNumber",
+            vec![Value::String("latest".to_string()), Value::Bool(false)],
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
