@@ -185,7 +185,7 @@
   },
   "json_rpc_error": {
     "network": "Paris",
-    "lastblockhash": "0x38e257fab98caf7f165cdec38a5547940e3709cf6d55e95acac0283d7a0d1985",
+    "lastblockhash": "0x12056e5b1e7c85d42cddeec96f458c855094eca76b999376b7bba0977c6dca18",
     "config": {
       "network": "Paris",
       "chainid": "0x01"
