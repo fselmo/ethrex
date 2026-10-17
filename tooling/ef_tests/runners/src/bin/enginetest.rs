@@ -27,7 +27,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    install_bal_report(&cli.runner, false);
+    install_bal_report(&cli.runner);
     let started = Instant::now();
     let rt = tokio::runtime::Runtime::new().expect("failed to build the tokio runtime");
     let files = match collect_json_files(cli.runner.fixture_paths()) {

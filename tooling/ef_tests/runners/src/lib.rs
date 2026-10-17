@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use clap::ArgAction;
-use ef_tests_blockchain::test_runner::DROPPED_ACCESS_LIST_TARGET;
+use ef_tests_blockchain::test_runner::{DROPPED_ACCESS_LIST_TARGET, WITHHELD_ACCESS_LIST_TARGET};
 use ethrex_vm::backends::levm::BAL_EXECUTION_TARGET;
 use regex::Regex;
 use serde::Serialize;
@@ -309,30 +309,31 @@ pub fn report(outcome: &RunOutcome, json: bool, started: Instant) -> ExitCode {
 /// With `--bal-report`, print the executor ethrex picks for each block as one
 /// JSON line on stderr:
 /// `{"event":"balExecution","block":N,"hash":"0x…","path":"parallel|sequential","reason":"…"}`.
-/// `reason` is `bad-access-list` for a block whose delivered list the runner dropped
-/// (the client then sees no list, so it would say `no-access-list`). Otherwise it is
-/// empty for `parallel`, and for `sequential` the first gate that ruled parallel out.
-/// With `withheld` (`blocktest --bal-withhold`) it is `withheld` on every line.
+/// `reason` is `bad-access-list` for a block whose delivered list the runner dropped,
+/// and `withheld` for a block whose list `blocktest --bal-withhold` withheld (the
+/// client then sees no list, so it would say `no-access-list`). Otherwise it is
+/// empty for `parallel`, and for `sequential` the first gate that ruled parallel out,
+/// also for a block without a list under `--bal-withhold`.
 /// Without the flag no subscriber is installed.
-pub fn install_bal_report(args: &RunnerArgs, withheld: bool) {
-    if let Some(layer) = bal_report_layer(args, withheld, std::io::stderr) {
+pub fn install_bal_report(args: &RunnerArgs) {
+    if let Some(layer) = bal_report_layer(args, std::io::stderr) {
         tracing_subscriber::registry().with(layer).init();
     }
 }
 
-fn bal_report_layer<S, W>(args: &RunnerArgs, withheld: bool, writer: W) -> Option<impl Layer<S>>
+fn bal_report_layer<S, W>(args: &RunnerArgs, writer: W) -> Option<impl Layer<S>>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
 {
     let filter = Targets::new()
         .with_target(BAL_EXECUTION_TARGET, Level::DEBUG)
-        .with_target(DROPPED_ACCESS_LIST_TARGET, Level::DEBUG);
+        .with_target(DROPPED_ACCESS_LIST_TARGET, Level::DEBUG)
+        .with_target(WITHHELD_ACCESS_LIST_TARGET, Level::DEBUG);
     args.bal_report.then(|| {
         BalExecutionReport {
             writer,
-            withheld,
-            dropped: Mutex::default(),
+            pending: Mutex::default(),
         }
         .with_filter(filter)
     })
@@ -340,10 +341,9 @@ where
 
 struct BalExecutionReport<W> {
     writer: W,
-    /// The runner withheld every block's list.
-    withheld: bool,
-    /// Delivered lists the runner dropped whose blocks have not run yet, by block hash.
-    dropped: Mutex<HashMap<String, usize>>,
+    /// For each block hash, the reasons (`bad-access-list` or `withheld`) of the lists
+    /// the runner kept from blocks that have not run yet.
+    pending: Mutex<HashMap<String, Vec<&'static str>>>,
 }
 
 impl<S, W> Layer<S> for BalExecutionReport<W>
@@ -357,30 +357,32 @@ where
             ..Default::default()
         };
         event.record(&mut line);
-        let mut dropped = self.dropped.lock().unwrap_or_else(|e| e.into_inner());
-        if event.metadata().target() == DROPPED_ACCESS_LIST_TARGET {
-            *dropped.entry(line.hash).or_default() += 1;
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = match event.metadata().target() {
+            DROPPED_ACCESS_LIST_TARGET => Some("bad-access-list"),
+            WITHHELD_ACCESS_LIST_TARGET => Some("withheld"),
+            _ => None,
+        };
+        if let Some(reason) = kept {
+            pending.entry(line.hash).or_default().push(reason);
             return;
         }
         // Execution runs on a thread of its own, so the event can't be tied to the
-        // import that dropped the list; the hash and the client's reason can. A block
-        // whose list was dropped reaches the client with none, and ethrex's first gate
-        // (with rayon) is the access list, so it always says `no-access-list`. Another
-        // worker may run the same block with its list at the same time (a fixture and
-        // its clean twin), and its event, which names any other reason, is left alone.
+        // import that kept the list; the hash and the client's reason can. A block
+        // whose list was dropped or withheld reaches the client with none, and
+        // ethrex's first gate (with rayon) is the access list, so it always says
+        // `no-access-list`. Another worker may run the same block with its list at the
+        // same time (a fixture and its clean twin), and its event, which names any
+        // other reason, is left alone.
         if line.reason == "no-access-list"
-            && let Some(pending) = dropped.get_mut(&line.hash)
+            && let Some(reasons) = pending.get_mut(&line.hash)
         {
-            *pending -= 1;
-            if *pending == 0 {
-                dropped.remove(&line.hash);
+            line.reason = reasons.remove(0).to_string();
+            if reasons.is_empty() {
+                pending.remove(&line.hash);
             }
-            line.reason = "bad-access-list".to_string();
         }
-        drop(dropped);
-        if self.withheld {
-            line.reason = "withheld".to_string();
-        }
+        drop(pending);
         if let Ok(mut line) = serde_json::to_string(&line) {
             line.push('\n');
             // One write per line, so lines from different workers don't interleave.
@@ -459,6 +461,8 @@ mod tests {
     enum Event {
         /// The runner dropped the block's delivered list.
         Dropped,
+        /// The runner withheld the block's list.
+        Withheld,
         /// The client ran the block on `path` for `reason`.
         Executed(&'static str, &'static str),
     }
@@ -469,11 +473,8 @@ mod tests {
         let cli = Cli::try_parse_from([&["runner", "--path", "fixtures"], args].concat())
             .expect("valid arguments");
         let buffer = Buffer::default();
-        let subscriber = tracing_subscriber::registry().with(bal_report_layer(
-            &cli.runner,
-            false,
-            buffer.clone(),
-        ));
+        let subscriber =
+            tracing_subscriber::registry().with(bal_report_layer(&cli.runner, buffer.clone()));
         tracing::subscriber::with_default(subscriber, || {
             for event in events {
                 match *event {
@@ -481,6 +482,11 @@ mod tests {
                         target: DROPPED_ACCESS_LIST_TARGET,
                         hash = %"0x01",
                         "Dropping the delivered access list"
+                    ),
+                    Event::Withheld => tracing::debug!(
+                        target: WITHHELD_ACCESS_LIST_TARGET,
+                        hash = %"0x01",
+                        "Withholding the delivered access list"
                     ),
                     Event::Executed(path, reason) => tracing::debug!(
                         target: BAL_EXECUTION_TARGET,
@@ -532,6 +538,22 @@ mod tests {
                 &[Event::Executed("sequential", "no-access-list")]
             ),
             line("sequential", "no-access-list")
+        );
+    }
+
+    /// Under `--bal-withhold` only a block that has a list says `withheld`; one
+    /// without (before Amsterdam) keeps the client's reason.
+    #[test]
+    fn bal_report_names_a_withheld_list() {
+        assert_eq!(
+            report_for(
+                &["--bal-report"],
+                &[
+                    Event::Withheld,
+                    Event::Executed("sequential", "no-access-list")
+                ]
+            ),
+            line("sequential", "withheld")
         );
     }
 
