@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use clap::ArgAction;
@@ -82,9 +82,6 @@ pub struct FixtureResult {
     /// gave it. The runner does not check these against the fixture's expected
     /// exception; whoever reads the results can.
     pub rejections: Vec<Rejection>,
-    /// The runner could not run this file at all, so the run exits 2.
-    #[serde(skip)]
-    pub runner_error: bool,
 }
 
 /// A block (in `blocks`) or payload (in `engineNewPayloads`) the client rejected.
@@ -124,17 +121,6 @@ impl FixtureResult {
             fork,
             error: error.unwrap_or_default(),
             rejections: Vec::new(),
-            runner_error: false,
-        }
-    }
-
-    /// A failed result for a fixture file the runner cannot read or parse, also
-    /// reported on stderr. The other files still run, and the run exits 2.
-    pub fn unreadable(file: &Path, error: String) -> Self {
-        eprintln!("error: cannot run {}: {error}", file.display());
-        Self {
-            runner_error: true,
-            ..Self::new(file.display().to_string(), String::new(), Some(error))
         }
     }
 
@@ -167,29 +153,44 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
 }
 
 /// Every path that is a file, and every `.json` file under the paths that are
-/// directories, sorted and each once. A path that does not exist, or a directory
-/// that cannot be read, is an error rather than no fixtures.
+/// directories, sorted and each once. A path that does not exist, or a file or
+/// directory that cannot be read, is an error rather than no fixtures, and every
+/// one of them is returned, so the run can report them before any fixture runs.
 pub fn collect_json_files<'a>(
     paths: impl IntoIterator<Item = &'a Path>,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<Vec<PathBuf>, Vec<String>> {
     let mut files = Vec::new();
+    let mut errors = Vec::new();
     for path in paths {
         if path.is_file() {
             files.push(path.to_path_buf());
             continue;
         }
         if !path.is_dir() {
-            return Err(format!(
+            errors.push(format!(
                 "no such fixture file or directory: {}",
                 path.display()
             ));
+            continue;
         }
         let mut dirs = vec![path.to_path_buf()];
         while let Some(dir) = dirs.pop() {
-            let entries = std::fs::read_dir(&dir)
-                .map_err(|e| format!("cannot read directory {}: {e}", dir.display()))?;
-            for entry in entries.flatten() {
-                let path = entry.path();
+            let cannot_read = |e| format!("cannot read directory {}: {e}", dir.display());
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    errors.push(cannot_read(e));
+                    continue;
+                }
+            };
+            for entry in entries {
+                let path = match entry {
+                    Ok(entry) => entry.path(),
+                    Err(e) => {
+                        errors.push(cannot_read(e));
+                        continue;
+                    }
+                };
                 if path.is_dir() {
                     dirs.push(path);
                 } else if path.extension().is_some_and(|ext| ext == "json") {
@@ -198,6 +199,14 @@ pub fn collect_json_files<'a>(
             }
         }
     }
+    for file in &files {
+        if let Err(e) = std::fs::File::open(file) {
+            errors.push(format!("cannot read {}: {e}", file.display()));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
     // A file named twice, or also found under a directory given, runs once.
     let mut seen = HashSet::new();
     files.retain(|file| seen.insert(file.canonicalize().unwrap_or_else(|_| file.clone())));
@@ -205,28 +214,43 @@ pub fn collect_json_files<'a>(
     Ok(files)
 }
 
+/// The results of a run, and whether a fixture file could not be run at all.
+pub struct RunOutcome {
+    pub results: Vec<FixtureResult>,
+    /// A file could not be read or parsed. It is reported on stderr, not in the
+    /// results, and the run exits 2.
+    pub file_failed: bool,
+}
+
 /// Run `run_file` over every file from `workers` threads, returning the results
-/// sorted by fixture name.
+/// sorted by fixture name. A file `run_file` cannot run is reported on stderr, and
+/// the other files still run.
 ///
 /// Plain threads rather than a rayon pool: block execution uses rayon itself, and
 /// running it from inside a pool's worker would hand it that pool's threads.
-pub fn run_files<F>(files: &[PathBuf], workers: usize, run_file: F) -> Vec<FixtureResult>
+pub fn run_files<F>(files: &[PathBuf], workers: usize, run_file: F) -> RunOutcome
 where
-    F: Fn(&Path) -> Vec<FixtureResult> + Sync,
+    F: Fn(&Path) -> Result<Vec<FixtureResult>, String> + Sync,
 {
     let next = AtomicUsize::new(0);
     let results = Mutex::new(Vec::new());
+    let file_failed = AtomicBool::new(false);
     std::thread::scope(|s| {
         for _ in 0..workers.max(1) {
             std::thread::Builder::new()
                 .stack_size(64 * 1024 * 1024)
                 .spawn_scoped(s, || {
                     while let Some(file) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let file_results = run_file(file);
-                        results
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .extend(file_results);
+                        match run_file(file) {
+                            Ok(file_results) => results
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .extend(file_results),
+                            Err(e) => {
+                                eprintln!("error: cannot run {}: {e}", file.display());
+                                file_failed.store(true, Ordering::Relaxed);
+                            }
+                        }
                     }
                 })
                 .expect("failed to spawn a worker thread");
@@ -234,7 +258,10 @@ where
     });
     let mut results = results.into_inner().unwrap_or_else(|e| e.into_inner());
     results.sort_by(|a, b| a.name.cmp(&b.name));
-    results
+    RunOutcome {
+        results,
+        file_failed: file_failed.into_inner(),
+    }
 }
 
 /// The exit status of a run that could not run all of its input: a path that
@@ -247,7 +274,8 @@ pub fn runner_error() -> ExitCode {
 
 /// Print the results (a JSON array on stdout with `json`, failures on stderr
 /// otherwise) and a summary on stderr, and return the exit code.
-pub fn report(results: &[FixtureResult], json: bool, started: Instant) -> ExitCode {
+pub fn report(outcome: &RunOutcome, json: bool, started: Instant) -> ExitCode {
+    let results = &outcome.results;
     if json {
         match serde_json::to_string_pretty(results) {
             Ok(out) => println!("{out}"),
@@ -269,7 +297,7 @@ pub fn report(results: &[FixtureResult], json: bool, started: Instant) -> ExitCo
         failed,
         started.elapsed().as_secs_f64(),
     );
-    if results.iter().any(|r| r.runner_error) {
+    if outcome.file_failed {
         runner_error()
     } else if failed > 0 {
         ExitCode::FAILURE
@@ -544,8 +572,8 @@ mod tests {
     #[test]
     fn a_missing_fixture_path_is_an_error() {
         let missing = Path::new("no/such/fixtures");
-        let err = collect_json_files([missing]).unwrap_err();
-        assert!(err.contains("no/such/fixtures"), "{err}");
+        let errors = collect_json_files([missing]).unwrap_err();
+        assert!(errors[0].contains("no/such/fixtures"), "{errors:?}");
     }
 
     #[test]
