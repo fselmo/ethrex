@@ -32,25 +32,27 @@ fn main() -> ExitCode {
     let rt = tokio::runtime::Runtime::new().expect("failed to build the tokio runtime");
     let files = match collect_json_files(cli.runner.fixture_paths()) {
         Ok(files) => files,
-        Err(e) => {
-            eprintln!("error: {e}");
+        Err(errors) => {
+            for e in errors {
+                eprintln!("error: {e}");
+            }
             return runner_error();
         }
     };
-    let results = run_files(&files, cli.runner.workers, |file| {
+    let outcome = run_files(&files, cli.runner.workers, |file| {
         run_file(file, &cli.runner, &rt)
     });
-    report(&results, cli.runner.json, started)
+    report(&outcome, cli.runner.json, started)
 }
 
-fn run_file(file: &Path, args: &RunnerArgs, rt: &tokio::runtime::Runtime) -> Vec<FixtureResult> {
-    let fixtures: EngineFixtureFile = match std::fs::read_to_string(file)
+fn run_file(
+    file: &Path,
+    args: &RunnerArgs,
+    rt: &tokio::runtime::Runtime,
+) -> Result<Vec<FixtureResult>, String> {
+    let fixtures: EngineFixtureFile = std::fs::read_to_string(file)
         .map_err(|e| e.to_string())
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
-    {
-        Ok(fixtures) => fixtures,
-        Err(e) => return vec![FixtureResult::unreadable(file, e)],
-    };
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))?;
     let opts = RunOptions {
         bal_parallel_exec: !args.bal_sequential,
         precompile_cache: !args.no_precompile_cache,
@@ -75,5 +77,5 @@ fn run_file(file: &Path, args: &RunnerArgs, rt: &tokio::runtime::Runtime) -> Vec
             rejections.into_iter().map(Into::into).collect(),
         ));
     }
-    results
+    Ok(results)
 }
